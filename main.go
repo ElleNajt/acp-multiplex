@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -13,16 +14,27 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: acp-multiplex <agent-command> [args...]\n")
-		fmt.Fprintf(os.Stderr, "\nSpawns the agent and multiplexes ACP sessions.\n")
-		fmt.Fprintf(os.Stderr, "Primary frontend: stdin/stdout of this process.\n")
-		fmt.Fprintf(os.Stderr, "Additional frontends: connect to the Unix socket printed below.\n")
+		fmt.Fprintf(os.Stderr, "usage:\n")
+		fmt.Fprintf(os.Stderr, "  acp-multiplex <agent-command> [args...]   Start proxy with agent\n")
+		fmt.Fprintf(os.Stderr, "  acp-multiplex attach <socket-path>        Connect stdio to existing proxy\n")
+		fmt.Fprintf(os.Stderr, "  acp-multiplex web <socket-path> [port]    Serve web UI for existing proxy\n")
 		os.Exit(1)
 	}
 
+	switch os.Args[1] {
+	case "attach":
+		runAttach()
+	case "web":
+		runWeb()
+	default:
+		runProxy()
+	}
+}
+
+// runProxy starts the agent subprocess and multiplexing proxy.
+func runProxy() {
 	agentArgs := os.Args[1:]
 
-	// Start agent subprocess
 	cmd := exec.Command(agentArgs[0], agentArgs[1:]...)
 	agentIn, err := cmd.StdinPipe()
 	if err != nil {
@@ -32,7 +44,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("agent stdout pipe: %v", err)
 	}
-	cmd.Stderr = os.Stderr // forward agent stderr
+	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
 		log.Fatalf("start agent: %v", err)
@@ -69,7 +81,6 @@ func main() {
 		}
 	}()
 
-	// Clean up on signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -79,9 +90,44 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Run proxy (blocks until agent exits)
 	go proxy.Run()
 	cmd.Wait()
+}
+
+// runAttach bridges stdin/stdout to an existing proxy's Unix socket.
+// This lets stdio-only ACP clients (Toad, acp-ui) connect as secondary frontends.
+func runAttach() {
+	if len(os.Args) < 3 {
+		fmt.Fprintf(os.Stderr, "usage: acp-multiplex attach <socket-path>\n")
+		os.Exit(1)
+	}
+	sockPath := os.Args[2]
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		log.Fatalf("connect to %s: %v", sockPath, err)
+	}
+	defer conn.Close()
+
+	// Bidirectional pipe: stdin -> socket, socket -> stdout
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(conn, os.Stdin); done <- struct{}{} }()
+	go func() { io.Copy(os.Stdout, conn); done <- struct{}{} }()
+	<-done
+}
+
+// runWeb serves a web UI that connects to an existing proxy's Unix socket.
+func runWeb() {
+	if len(os.Args) < 3 {
+		fmt.Fprintf(os.Stderr, "usage: acp-multiplex web <socket-path> [port]\n")
+		os.Exit(1)
+	}
+	sockPath := os.Args[2]
+	port := "8080"
+	if len(os.Args) >= 4 {
+		port = os.Args[3]
+	}
+	serveWeb(sockPath, port)
 }
 
 func socketPath() string {
@@ -93,7 +139,6 @@ func socketPath() string {
 }
 
 func listenUnix(path string) (net.Listener, error) {
-	// Remove stale socket if it exists
 	os.Remove(path)
 	return net.Listen("unix", path)
 }
