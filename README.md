@@ -53,7 +53,7 @@ Any ACP client that talks stdio can be a primary frontend — just prefix the ag
 acp-multiplex claude-code-acp
 ```
 
-The primary frontend talks to the proxy on stdin/stdout as if it were the agent directly.
+The primary frontend talks to the proxy on stdin/stdout as if it were the agent directly. Examples: [agent-shell](https://github.com/xenodium/agent-shell) (Emacs), [Zed](https://zed.dev/), [Toad](https://github.com/lukesmurray/toad).
 
 ### Secondary frontends
 
