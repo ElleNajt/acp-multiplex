@@ -239,7 +239,7 @@ func (p *Proxy) readFromAgent() {
             p.routeResponseToFrontend(env, line)
 
         case KindRequest:
-            p.routeReverseCall(line)
+            p.routeReverseCall(env, line)
         }
     }
 }
@@ -300,15 +300,20 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 
 ~p.pending~ is a ~sync.Map~ — a concurrent map from proxy ID to ~PendingRequest~. ~LoadAndDelete~ atomically retrieves and removes the entry.
 
-*** Reverse calls: primary only
+*** Reverse calls: broadcast, first response wins
 
-The agent can also /send/ requests to the frontend — file reads (~fs/*~), terminal commands (~terminal/*~), permission requests (~session/requestPermission~). These go only to the primary frontend:
+The agent can also /send/ requests to the frontend — file reads (~fs/*~), terminal commands (~terminal/*~), permission requests (~session/requestPermission~). These are broadcast to all frontends. The first one to respond wins; duplicate responses are dropped.
 
 #+begin_src go
-func (p *Proxy) routeReverseCall(line []byte) {
-    p.sendToPrimary(line)
+func (p *Proxy) routeReverseCall(env *Envelope, line []byte) {
+    if env.ID != nil {
+        p.pendingReverse.Store(string(*env.ID), struct{}{})
+    }
+    p.broadcast(line)
 }
 #+end_src
+
+~pendingReverse~ is a ~sync.Map~ keyed by the agent's request ID. When a frontend responds, ~LoadAndDelete~ atomically checks and removes the entry — if it was there, this is the first response and it gets forwarded. If it was already removed, another frontend responded first and this response is dropped.
 
 ** Frontends -> agent
 
@@ -329,13 +334,19 @@ func (p *Proxy) readFromFrontends() {
         case KindNotification:
             p.sendToAgent(msg.Line)
         case KindResponse:
-            p.sendToAgent(msg.Line)
+            // First-response-wins for reverse calls
+            if env.ID != nil {
+                idKey := string(*env.ID)
+                if _, loaded := p.pendingReverse.LoadAndDelete(idKey); loaded {
+                    p.sendToAgent(msg.Line)
+                }
+            }
         }
     }
 }
 #+end_src
 
-Notifications and responses pass through unchanged. Requests get ID-rewritten:
+Notifications pass through unchanged. Responses are checked against ~pendingReverse~ — only the first response for each reverse call ID gets forwarded. Requests get ID-rewritten:
 
 #+begin_src go
 func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
