@@ -19,7 +19,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "usage:\n")
 		fmt.Fprintf(os.Stderr, "  acp-multiplex <agent-command> [args...]   Start proxy with agent\n")
 		fmt.Fprintf(os.Stderr, "  acp-multiplex attach <socket-path>        Connect stdio to existing proxy\n")
-		fmt.Fprintf(os.Stderr, "  acp-multiplex web <socket-path> [port]    Serve web UI for existing proxy\n")
+		fmt.Fprintf(os.Stderr, "  acp-multiplex web <socket-path> [port] [--ui file]  Serve web UI for existing proxy\n")
 		os.Exit(1)
 	}
 
@@ -123,15 +123,21 @@ func runAttach() {
 // runWeb serves a web UI that connects to an existing proxy's Unix socket.
 func runWeb() {
 	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "usage: acp-multiplex web <socket-path> [port]\n")
+		fmt.Fprintf(os.Stderr, "usage: acp-multiplex web <socket-path> [port] [--ui path/to/index.html]\n")
 		os.Exit(1)
 	}
 	sockPath := os.Args[2]
 	port := "8080"
-	if len(os.Args) >= 4 {
-		port = os.Args[3]
+	uiFile := ""
+	for i := 3; i < len(os.Args); i++ {
+		if os.Args[i] == "--ui" && i+1 < len(os.Args) {
+			uiFile = os.Args[i+1]
+			i++
+		} else if port == "8080" {
+			port = os.Args[i]
+		}
 	}
-	serveWeb(sockPath, port)
+	serveWeb(sockPath, port, uiFile)
 }
 
 func socketPath() string {
