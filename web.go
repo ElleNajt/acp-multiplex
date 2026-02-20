@@ -2,11 +2,16 @@ package main
 
 import (
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 
 	"golang.org/x/net/websocket"
@@ -17,12 +22,16 @@ var indexHTML string
 
 // serveWeb starts an HTTP server with a WebSocket endpoint that bridges
 // to the proxy's Unix socket, plus a minimal chat UI.
-func serveWeb(sockPath string, port string) {
+func serveWeb(sockPath string, port string, uiFile string) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(indexHTML))
+		if uiFile != "" {
+			http.ServeFile(w, r, uiFile)
+		} else {
+			w.Write([]byte(indexHTML))
+		}
 	})
 
 	mux.Handle("/ws", &websocket.Server{
@@ -35,9 +44,113 @@ func serveWeb(sockPath string, port string) {
 		},
 	})
 
+	mux.HandleFunc("/files/list", handleFileList)
+	mux.HandleFunc("/files/read", handleFileRead)
+
 	addr := fmt.Sprintf("127.0.0.1:%s", port)
 	log.Printf("web UI: http://%s", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+type fileEntry struct {
+	Name  string `json:"name"`
+	IsDir bool   `json:"isDir"`
+	Size  int64  `json:"size,omitempty"`
+}
+
+func handleFileList(w http.ResponseWriter, r *http.Request) {
+	dirPath := r.URL.Query().Get("path")
+	if dirPath == "" {
+		dirPath = "."
+	}
+	showHidden := r.URL.Query().Get("show_hidden") == "true"
+
+	// Resolve to absolute, clean path
+	absPath, err := filepath.Abs(dirPath)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	entries, err := os.ReadDir(absPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	var files []fileEntry
+	for _, e := range entries {
+		name := e.Name()
+		if !showHidden && strings.HasPrefix(name, ".") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		fe := fileEntry{Name: name, IsDir: e.IsDir()}
+		if !e.IsDir() {
+			fe.Size = info.Size()
+		}
+		files = append(files, fe)
+	}
+
+	// Sort: dirs first, then alphabetical
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].IsDir != files[j].IsDir {
+			return files[i].IsDir
+		}
+		return strings.ToLower(files[i].Name) < strings.ToLower(files[j].Name)
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"path":  absPath,
+		"files": files,
+	})
+}
+
+func handleFileRead(w http.ResponseWriter, r *http.Request) {
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		http.Error(w, "path required", http.StatusBadRequest)
+		return
+	}
+
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if info.IsDir() {
+		http.Error(w, "path is a directory", http.StatusBadRequest)
+		return
+	}
+
+	// 1MB limit for text files
+	const maxSize = 1024 * 1024
+	if info.Size() > maxSize {
+		http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"path":    absPath,
+		"content": string(data),
+	})
 }
 
 // handleWebSocket bridges a WebSocket connection to the proxy's Unix socket.

@@ -8,6 +8,7 @@ type Cache struct {
 	initResp []byte   // cached initialize response
 	newResp  []byte   // cached session/new response
 	updates  [][]byte // all session/update notifications, in order
+	cwd      string   // working directory from session/new request
 }
 
 func NewCache() *Cache {
@@ -24,6 +25,18 @@ func (c *Cache) SetNewResponse(line []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.newResp = append([]byte(nil), line...)
+}
+
+func (c *Cache) SetCwd(cwd string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cwd = cwd
+}
+
+func (c *Cache) Cwd() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cwd
 }
 
 func (c *Cache) AddUpdate(line []byte) {

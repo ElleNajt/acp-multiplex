@@ -187,6 +187,20 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 	case "session/new":
 		rewritten, err := rewriteID(line, 0)
 		if err == nil {
+			// Inject cwd into the response so replayed clients can find it.
+			if cwd := p.cache.Cwd(); cwd != "" {
+				var raw map[string]json.RawMessage
+				if err2 := json.Unmarshal(rewritten, &raw); err2 == nil {
+					if result, ok := raw["result"]; ok {
+						var res map[string]json.RawMessage
+						if err3 := json.Unmarshal(result, &res); err3 == nil {
+							res["cwd"], _ = json.Marshal(cwd)
+							raw["result"], _ = json.Marshal(res)
+							rewritten, _ = json.Marshal(raw)
+						}
+					}
+				}
+			}
 			p.cache.SetNewResponse(rewritten)
 		}
 	}
@@ -272,6 +286,16 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 	if err != nil {
 		log.Printf("failed to rewrite id: %v", err)
 		return
+	}
+
+	// Extract cwd from session/new requests for the file browser.
+	if env.Method == "session/new" {
+		var params struct {
+			Cwd string `json:"cwd"`
+		}
+		if err := json.Unmarshal(env.Params, &params); err == nil && params.Cwd != "" {
+			p.cache.SetCwd(params.Cwd)
+		}
 	}
 
 	// Synthesize user_message_chunk notifications for session/prompt
