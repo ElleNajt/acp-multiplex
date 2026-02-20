@@ -89,6 +89,10 @@ func handleWebSocket(ws *websocket.Conn, sockPath string) {
 				return
 			}
 			buf = append(buf, tmp[:n]...)
+			if len(buf) > 1024*1024 {
+				log.Printf("ws: buffer exceeded 1MB, disconnecting")
+				return
+			}
 			// Split on newlines and send each complete line
 			for {
 				nlIdx := -1

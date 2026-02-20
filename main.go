@@ -140,5 +140,11 @@ func socketPath() string {
 
 func listenUnix(path string) (net.Listener, error) {
 	os.Remove(path)
-	return net.Listen("unix", path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	// Owner-only so other users on the machine can't connect.
+	os.Chmod(path, 0600)
+	return ln, nil
 }
