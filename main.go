@@ -19,7 +19,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "usage:\n")
 		fmt.Fprintf(os.Stderr, "  acp-multiplex <agent-command> [args...]   Start proxy with agent\n")
 		fmt.Fprintf(os.Stderr, "  acp-multiplex attach <socket-path>        Connect stdio to existing proxy\n")
-		fmt.Fprintf(os.Stderr, "  acp-multiplex web <socket-path> [port] [--ui file]  Serve web UI for existing proxy\n")
+		fmt.Fprintf(os.Stderr, "  acp-multiplex web <socket|--discover> [port] [--ui file]  Serve web UI\n")
 		os.Exit(1)
 	}
 
@@ -120,56 +120,77 @@ func runAttach() {
 	<-done
 }
 
-// runWeb serves a web UI that connects to an existing proxy's Unix socket.
+// runWeb serves a web UI that connects to proxy Unix socket(s).
+// With a socket path: single-session mode (connects to that socket).
+// With --discover: multi-session mode (scans socket directory).
 func runWeb() {
 	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "usage: acp-multiplex web <socket-path> [port] [--ui path/to/index.html]\n")
+		fmt.Fprintf(os.Stderr, "usage: acp-multiplex web <socket-path|--discover> [port] [--ui path/to/index.html]\n")
 		os.Exit(1)
 	}
-	sockPath := os.Args[2]
+
+	sockPath := ""
 	port := "8080"
 	uiFile := ""
-	for i := 3; i < len(os.Args); i++ {
-		if os.Args[i] == "--ui" && i+1 < len(os.Args) {
+	discover := false
+
+	for i := 2; i < len(os.Args); i++ {
+		switch {
+		case os.Args[i] == "--discover":
+			discover = true
+		case os.Args[i] == "--ui" && i+1 < len(os.Args):
 			uiFile = os.Args[i+1]
 			i++
-		} else if port == "8080" {
+		case sockPath == "" && !discover && !strings.HasPrefix(os.Args[i], "--"):
+			sockPath = os.Args[i]
+		case port == "8080" && !strings.HasPrefix(os.Args[i], "--"):
 			port = os.Args[i]
 		}
 	}
+
+	if !discover && sockPath == "" {
+		fmt.Fprintf(os.Stderr, "error: provide a socket path or --discover\n")
+		os.Exit(1)
+	}
+	if discover {
+		sockPath = "" // empty means discover mode in serveWeb
+	}
+
 	serveWeb(sockPath, port, uiFile)
 }
 
-func socketPath() string {
+// socketDir returns the directory for acp-multiplex sockets, creating it if needed.
+func socketDir() string {
 	dir := os.Getenv("XDG_RUNTIME_DIR")
 	if dir == "" {
 		dir = os.TempDir()
 	}
-	return filepath.Join(dir, fmt.Sprintf("acp-multiplex-%d.sock", os.Getpid()))
+	dir = filepath.Join(dir, "acp-multiplex")
+	os.MkdirAll(dir, 0700)
+	return dir
 }
 
-// cleanStaleSockets removes acp-multiplex sockets whose owning process is dead.
+func socketPath() string {
+	return filepath.Join(socketDir(), fmt.Sprintf("%d.sock", os.Getpid()))
+}
+
+// cleanStaleSockets removes sockets whose owning process is dead.
 func cleanStaleSockets() {
-	dir := os.Getenv("XDG_RUNTIME_DIR")
-	if dir == "" {
-		dir = os.TempDir()
-	}
+	dir := socketDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if !strings.HasPrefix(name, "acp-multiplex-") || !strings.HasSuffix(name, ".sock") {
+		if !strings.HasSuffix(name, ".sock") {
 			continue
 		}
-		pidStr := strings.TrimPrefix(name, "acp-multiplex-")
-		pidStr = strings.TrimSuffix(pidStr, ".sock")
+		pidStr := strings.TrimSuffix(name, ".sock")
 		pid, err := strconv.Atoi(pidStr)
 		if err != nil {
 			continue
 		}
-		// Signal 0 checks if process exists without actually signaling it.
 		if err := syscall.Kill(pid, 0); err != nil {
 			os.Remove(filepath.Join(dir, name))
 		}

@@ -1,7 +1,7 @@
 package main
 
 import (
-	_ "embed"
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,45 +11,207 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"golang.org/x/net/websocket"
 )
 
-//go:embed index.html
-var indexHTML string
-
 // serveWeb starts an HTTP server with a WebSocket endpoint that bridges
 // to the proxy's Unix socket, plus a minimal chat UI.
+// If sockPath is empty, it runs in "discover" mode: scanning the socket
+// directory for all live proxies.
 func serveWeb(sockPath string, port string, uiFile string) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if uiFile != "" {
 			http.ServeFile(w, r, uiFile)
 		} else {
-			w.Write([]byte(indexHTML))
+			w.Write([]byte("<html><body>acp-multiplex: use --ui to serve a UI</body></html>"))
 		}
 	})
 
 	mux.Handle("/ws", &websocket.Server{
 		Handler: func(ws *websocket.Conn) {
-			handleWebSocket(ws, sockPath)
+			target := sockPath
+			// In discover mode, allow ?sock=<pid> to pick which socket
+			if target == "" {
+				pid := ws.Request().URL.Query().Get("sock")
+				if pid == "" {
+					log.Printf("ws: no sock param in discover mode")
+					ws.Close()
+					return
+				}
+				target = filepath.Join(socketDir(), pid+".sock")
+			}
+			handleWebSocket(ws, target)
 		},
 		Handshake: func(config *websocket.Config, r *http.Request) error {
 			config.Origin, _ = websocket.Origin(config, r)
-			return nil // accept any origin (localhost only)
+			return nil
 		},
 	})
 
+	mux.HandleFunc("/api/sessions", handleSessionList)
 	mux.HandleFunc("/files/list", handleFileList)
 	mux.HandleFunc("/files/read", handleFileRead)
 
 	addr := fmt.Sprintf("127.0.0.1:%s", port)
 	log.Printf("web UI: http://%s", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+// sessionInfo is returned by /api/sessions for each live socket.
+type sessionInfo struct {
+	Pid       int    `json:"pid"`
+	SessionID string `json:"sessionId,omitempty"`
+	Title     string `json:"title,omitempty"`
+	Cwd       string `json:"cwd,omitempty"`
+}
+
+// handleSessionList scans the socket directory for live proxies,
+// connects briefly to each to read cached session info from the replay.
+func handleSessionList(w http.ResponseWriter, r *http.Request) {
+	dir := socketDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"sessions": []interface{}{}})
+		return
+	}
+
+	type result struct {
+		info sessionInfo
+		ok   bool
+	}
+
+	var wg sync.WaitGroup
+	results := make([]result, len(entries))
+
+	for i, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".sock") {
+			continue
+		}
+		pidStr := strings.TrimSuffix(name, ".sock")
+		pid, err := strconv.Atoi(pidStr)
+		if err != nil {
+			continue
+		}
+		// Check process is alive
+		if err := syscall.Kill(pid, 0); err != nil {
+			os.Remove(filepath.Join(dir, name))
+			continue
+		}
+
+		idx := i
+		sockFile := filepath.Join(dir, name)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			info, err := probeSocket(sockFile, pid)
+			if err != nil {
+				log.Printf("probe %s: %v", sockFile, err)
+				return
+			}
+			results[idx] = result{info: info, ok: true}
+		}()
+	}
+	wg.Wait()
+
+	var sessions []sessionInfo
+	for _, r := range results {
+		if r.ok {
+			sessions = append(sessions, r.info)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": sessions})
+}
+
+// probeSocket connects to a proxy socket, reads the replay messages,
+// and extracts session info (sessionId, title/agentInfo, cwd).
+func probeSocket(sockPath string, pid int) (sessionInfo, error) {
+	info := sessionInfo{Pid: pid}
+
+	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
+	if err != nil {
+		return info, err
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var msg struct {
+			Result json.RawMessage `json:"result"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.Unmarshal(line, &msg); err != nil {
+			continue
+		}
+
+		// Check responses for agentInfo and sessionId
+		if msg.Result != nil {
+			var res struct {
+				AgentInfo *struct {
+					Title string `json:"title"`
+					Name  string `json:"name"`
+				} `json:"agentInfo"`
+				SessionID string `json:"sessionId"`
+				Cwd       string `json:"cwd"`
+			}
+			if err := json.Unmarshal(msg.Result, &res); err == nil {
+				if res.AgentInfo != nil {
+					info.Title = res.AgentInfo.Title
+					if info.Title == "" {
+						info.Title = res.AgentInfo.Name
+					}
+				}
+				if res.SessionID != "" {
+					info.SessionID = res.SessionID
+				}
+				if res.Cwd != "" {
+					info.Cwd = res.Cwd
+				}
+			}
+		}
+
+		// Check for title updates in session notifications
+		if msg.Method == "session/update" && msg.Params != nil {
+			var params struct {
+				Update struct {
+					Kind  string `json:"sessionUpdate"`
+					Title string `json:"title"`
+				} `json:"update"`
+			}
+			if err := json.Unmarshal(msg.Params, &params); err == nil {
+				if params.Update.Kind == "title_update" && params.Update.Title != "" {
+					info.Title = params.Update.Title
+				}
+			}
+		}
+	}
+
+	return info, nil
 }
 
 type fileEntry struct {
@@ -65,7 +227,6 @@ func handleFileList(w http.ResponseWriter, r *http.Request) {
 	}
 	showHidden := r.URL.Query().Get("show_hidden") == "true"
 
-	// Resolve to absolute, clean path
 	absPath, err := filepath.Abs(dirPath)
 	if err != nil {
 		http.Error(w, "invalid path", http.StatusBadRequest)
@@ -95,7 +256,6 @@ func handleFileList(w http.ResponseWriter, r *http.Request) {
 		files = append(files, fe)
 	}
 
-	// Sort: dirs first, then alphabetical
 	sort.Slice(files, func(i, j int) bool {
 		if files[i].IsDir != files[j].IsDir {
 			return files[i].IsDir
@@ -133,7 +293,6 @@ func handleFileRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1MB limit for text files
 	const maxSize = 1024 * 1024
 	if info.Size() > maxSize {
 		http.Error(w, "file too large", http.StatusRequestEntityTooLarge)
@@ -153,9 +312,7 @@ func handleFileRead(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleWebSocket bridges a WebSocket connection to the proxy's Unix socket.
-// Messages from WebSocket are sent as ndjson to the socket.
-// Lines from the socket are sent as WebSocket text frames.
+// handleWebSocket bridges a WebSocket connection to a proxy's Unix socket.
 func handleWebSocket(ws *websocket.Conn, sockPath string) {
 	conn, err := net.Dial("unix", sockPath)
 	if err != nil {
@@ -182,7 +339,6 @@ func handleWebSocket(ws *websocket.Conn, sockPath string) {
 				}
 				return
 			}
-			// Write as ndjson line
 			conn.Write([]byte(msg))
 			conn.Write([]byte("\n"))
 		}
@@ -206,7 +362,6 @@ func handleWebSocket(ws *websocket.Conn, sockPath string) {
 				log.Printf("ws: buffer exceeded 1MB, disconnecting")
 				return
 			}
-			// Split on newlines and send each complete line
 			for {
 				nlIdx := -1
 				for i, b := range buf {
