@@ -19,15 +19,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "usage:\n")
 		fmt.Fprintf(os.Stderr, "  acp-multiplex <agent-command> [args...]   Start proxy with agent\n")
 		fmt.Fprintf(os.Stderr, "  acp-multiplex attach <socket-path>        Connect stdio to existing proxy\n")
-		fmt.Fprintf(os.Stderr, "  acp-multiplex web <socket|--discover> [port] [--ui file]  Serve web UI\n")
 		os.Exit(1)
 	}
 
 	switch os.Args[1] {
 	case "attach":
 		runAttach()
-	case "web":
-		runWeb()
 	default:
 		runProxy()
 	}
@@ -118,45 +115,6 @@ func runAttach() {
 	go func() { io.Copy(conn, os.Stdin); done <- struct{}{} }()
 	go func() { io.Copy(os.Stdout, conn); done <- struct{}{} }()
 	<-done
-}
-
-// runWeb serves a web UI that connects to proxy Unix socket(s).
-// With a socket path: single-session mode (connects to that socket).
-// With --discover: multi-session mode (scans socket directory).
-func runWeb() {
-	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "usage: acp-multiplex web <socket-path|--discover> [port] [--ui path/to/index.html]\n")
-		os.Exit(1)
-	}
-
-	sockPath := ""
-	port := "8080"
-	uiFile := ""
-	discover := false
-
-	for i := 2; i < len(os.Args); i++ {
-		switch {
-		case os.Args[i] == "--discover":
-			discover = true
-		case os.Args[i] == "--ui" && i+1 < len(os.Args):
-			uiFile = os.Args[i+1]
-			i++
-		case sockPath == "" && !discover && !strings.HasPrefix(os.Args[i], "--"):
-			sockPath = os.Args[i]
-		case port == "8080" && !strings.HasPrefix(os.Args[i], "--"):
-			port = os.Args[i]
-		}
-	}
-
-	if !discover && sockPath == "" {
-		fmt.Fprintf(os.Stderr, "error: provide a socket path or --discover\n")
-		os.Exit(1)
-	}
-	if discover {
-		sockPath = "" // empty means discover mode in serveWeb
-	}
-
-	serveWeb(sockPath, port, uiFile)
 }
 
 // socketDir returns the directory for acp-multiplex sockets, creating it if needed.
