@@ -10,6 +10,7 @@ import (
 // coalesced into single messages so replay is compact and fast.
 type Cache struct {
 	mu       sync.Mutex
+	meta     []byte   // optional session metadata (name, etc.)
 	initResp []byte   // cached initialize response
 	newResp  []byte   // cached session/new response
 	updates  [][]byte // coalesced session/update notifications
@@ -27,6 +28,12 @@ type updateMeta struct {
 
 func NewCache() *Cache {
 	return &Cache{}
+}
+
+func (c *Cache) SetMeta(line []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.meta = append([]byte(nil), line...)
 }
 
 func (c *Cache) SetInitResponse(line []byte) {
@@ -106,10 +113,14 @@ func (c *Cache) Replay(f *Frontend) {
 	// Snapshot under lock
 	initResp := c.initResp
 	newResp := c.newResp
+	meta := c.meta
 	updates := make([][]byte, len(c.updates))
 	copy(updates, c.updates)
 	c.mu.Unlock()
 
+	if meta != nil {
+		f.Send(meta)
+	}
 	if initResp != nil {
 		f.Send(initResp)
 	}

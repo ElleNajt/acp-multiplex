@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -52,6 +53,17 @@ func runProxy() {
 	}
 
 	cache := NewCache()
+
+	// If a session name is provided, cache it as metadata for secondary frontends.
+	if name := os.Getenv("ACP_MULTIPLEX_NAME"); name != "" {
+		meta, _ := json.Marshal(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"method":  "acp-multiplex/meta",
+			"params":  map[string]string{"name": name},
+		})
+		cache.SetMeta(meta)
+	}
+
 	proxy := NewProxy(agentIn, agentOut, cache)
 
 	// Primary frontend on stdin/stdout

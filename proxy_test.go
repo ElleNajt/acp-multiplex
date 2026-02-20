@@ -216,7 +216,7 @@ func TestProxyFanOut(t *testing.T) {
 		t.Errorf("frontend 2: expected agent session/update, got %s", update2)
 	}
 
-	// Frontend 1 should also get the prompt response
+	// Frontend 1 should get the prompt response
 	resp1 := readLine(t, fe1Scanner, 2*time.Second)
 	var r1 map[string]interface{}
 	json.Unmarshal(resp1, &r1)
@@ -227,6 +227,22 @@ func TestProxyFanOut(t *testing.T) {
 	idFloat, ok := r1["id"].(float64)
 	if !ok || int(idFloat) != 3 {
 		t.Errorf("expected id=3 in prompt response, got %v", r1["id"])
+	}
+
+	// Frontend 2 should get a synthetic turn_complete notification
+	turnComplete := readLine(t, fe2Scanner, 2*time.Second)
+	var tc map[string]interface{}
+	json.Unmarshal(turnComplete, &tc)
+	if tc["method"] != "session/update" {
+		t.Errorf("expected session/update for turn_complete, got %s", turnComplete)
+	}
+	params := tc["params"].(map[string]interface{})
+	update := params["update"].(map[string]interface{})
+	if update["sessionUpdate"] != "turn_complete" {
+		t.Errorf("expected turn_complete, got %v", update["sessionUpdate"])
+	}
+	if update["stopReason"] != "endTurn" {
+		t.Errorf("expected stopReason endTurn, got %v", update["stopReason"])
 	}
 }
 
@@ -290,6 +306,59 @@ func TestProxyIDRewriting(t *testing.T) {
 	// Should have id:1 (frontend 2's original ID), not the proxy's rewritten ID
 	if id, ok := r2["id"].(float64); !ok || int(id) != 1 {
 		t.Errorf("frontend 2: expected id=1, got %v", r2["id"])
+	}
+}
+
+func TestMetadataReplay(t *testing.T) {
+	cache := NewCache()
+
+	// Set metadata
+	meta, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "acp-multiplex/meta",
+		"params":  map[string]string{"name": "Claude Code Agent @ myproject"},
+	})
+	cache.SetMeta(meta)
+
+	// Set an init response too
+	initResp, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      0,
+		"result":  map[string]string{"protocolVersion": "1"},
+	})
+	cache.SetInitResponse(initResp)
+
+	// Replay to a frontend and check order: meta first, then init
+	pr, pw := io.Pipe()
+	scanner := bufio.NewScanner(pr)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	f := &Frontend{
+		id:     99,
+		writer: pw,
+		done:   make(chan struct{}),
+	}
+
+	go cache.Replay(f)
+
+	// First line should be metadata
+	line1 := readLine(t, scanner, 2*time.Second)
+	var m map[string]interface{}
+	json.Unmarshal(line1, &m)
+	if m["method"] != "acp-multiplex/meta" {
+		t.Errorf("expected acp-multiplex/meta, got %v", m["method"])
+	}
+	params := m["params"].(map[string]interface{})
+	if params["name"] != "Claude Code Agent @ myproject" {
+		t.Errorf("expected name in meta, got %v", params["name"])
+	}
+
+	// Second line should be init response
+	line2 := readLine(t, scanner, 2*time.Second)
+	var ir map[string]interface{}
+	json.Unmarshal(line2, &ir)
+	if ir["result"] == nil {
+		t.Errorf("expected init response with result, got %s", line2)
 	}
 }
 

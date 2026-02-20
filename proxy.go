@@ -188,6 +188,12 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 		}
 	}
 
+	// For session/prompt responses, synthesize a turn-complete notification
+	// so other frontends know the agent finished (they don't get the response).
+	if pr.method == "session/prompt" {
+		p.synthesizeTurnComplete(line, pr.frontend)
+	}
+
 	// Rewrite ID back to the frontend's original
 	rewritten, err := restoreID(line, pr.originalID)
 	if err != nil {
@@ -317,6 +323,51 @@ func (p *Proxy) synthesizeUserMessage(env *Envelope, sender *Frontend) {
 		p.cache.AddUpdate(line)
 		p.broadcastExcept(line, sender)
 	}
+}
+
+// synthesizeTurnComplete extracts the stopReason from a session/prompt response
+// and broadcasts a synthetic session/update notification to all frontends except
+// the one that sent the prompt. This lets other frontends know the turn is over
+// (they only see streaming notifications, not the response).
+func (p *Proxy) synthesizeTurnComplete(responseLine []byte, sender *Frontend) {
+	var resp struct {
+		Result struct {
+			StopReason string `json:"stopReason"`
+			SessionID  string `json:"sessionId"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(responseLine, &resp); err != nil {
+		return
+	}
+
+	stopReason := resp.Result.StopReason
+	if stopReason == "" {
+		return
+	}
+
+	// Try to get sessionId from the response; fall back to empty
+	sessionID := resp.Result.SessionID
+
+	notif := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]interface{}{
+			"sessionId": sessionID,
+			"update": map[string]interface{}{
+				"sessionUpdate": "turn_complete",
+				"stopReason":    stopReason,
+			},
+		},
+	}
+
+	line, err := json.Marshal(notif)
+	if err != nil {
+		log.Printf("synthesize turn complete: marshal: %v", err)
+		return
+	}
+
+	p.cache.AddUpdate(line)
+	go p.broadcastExcept(line, sender)
 }
 
 // restoreID replaces the "id" field with the original raw JSON value.
