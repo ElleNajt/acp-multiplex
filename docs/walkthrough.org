@@ -75,7 +75,24 @@ func classify(env *Envelope) MessageKind {
 
 ** ID rewriting
 
-This is the key trick. Two frontends might both send a request with ~id: 1~. The agent would see two requests with the same id and get confused. So the proxy rewrites IDs:
+Both frontends talk to the same agent session — one agent process, one conversation. But JSON-RPC requires every request to have an ~id~ so the response can be matched to it. Each frontend picks its own IDs independently (both might start at 1 and count up). The agent only has one stdin — if it sees two requests with ~id: 1~, it can't tell which frontend to send the response to.
+
+This is the same problem a reverse proxy has with HTTP/2 stream IDs: multiple clients, one backend, need to keep request/response pairs straight.
+
+The proxy solves it by rewriting IDs with a single monotonic counter:
+
+#+begin_example
+Frontend A sends:  {"id": 1, ...}  ->  proxy rewrites to {"id": 7, ...}  ->  agent
+Frontend B sends:  {"id": 1, ...}  ->  proxy rewrites to {"id": 8, ...}  ->  agent
+
+Agent responds:    {"id": 7, ...}  ->  proxy looks up 7 = (A, orig 1)
+                                   ->  rewrites to {"id": 1, ...}  ->  Frontend A only
+
+Agent responds:    {"id": 8, ...}  ->  proxy looks up 8 = (B, orig 1)
+                                   ->  rewrites to {"id": 1, ...}  ->  Frontend B only
+#+end_example
+
+Each frontend thinks it's talking directly to the agent. It sent id 1, it got back id 1. It has no idea the proxy exists.
 
 #+begin_src go
 func rewriteID(line []byte, newID int64) ([]byte, error) {
@@ -90,11 +107,7 @@ func rewriteID(line []byte, newID int64) ([]byte, error) {
     raw["id"] = json.RawMessage(idBytes)
     return json.Marshal(raw)
 }
-#+end_src
 
-And when the response comes back, restore the original:
-
-#+begin_src go
 func restoreID(line []byte, origID json.RawMessage) ([]byte, error) {
     var raw map[string]json.RawMessage
     if err := json.Unmarshal(line, &raw); err != nil {
@@ -104,8 +117,6 @@ func restoreID(line []byte, origID json.RawMessage) ([]byte, error) {
     return json.Marshal(raw)
 }
 #+end_src
-
-The proxy keeps a monotonically increasing counter. Frontend A sends ~id:1~, proxy rewrites to ~id:7~, remembers "7 -> (Frontend A, original id 1)". Frontend B sends ~id:1~, proxy rewrites to ~id:8~. The agent sees 7 and 8 — no collision.
 
 * The frontend abstraction (~frontend.go~)
 
