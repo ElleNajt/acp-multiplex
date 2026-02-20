@@ -58,6 +58,13 @@ func (p *Proxy) AddFrontend(f *Frontend) {
 	// Start reading from this frontend
 	go f.ReadLines(p.fromFrontends)
 
+	// Remove the frontend when it disconnects.
+	go func() {
+		<-f.done
+		p.RemoveFrontend(f)
+		log.Printf("frontend %d disconnected", f.id)
+	}()
+
 	// Replay cached history for non-primary frontends.
 	// Run in a goroutine because Send may block on synchronous writers.
 	if !f.primary {
