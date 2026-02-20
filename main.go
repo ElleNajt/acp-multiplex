@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -33,6 +35,8 @@ func main() {
 
 // runProxy starts the agent subprocess and multiplexing proxy.
 func runProxy() {
+	cleanStaleSockets()
+
 	agentArgs := os.Args[1:]
 
 	cmd := exec.Command(agentArgs[0], agentArgs[1:]...)
@@ -136,6 +140,34 @@ func socketPath() string {
 		dir = os.TempDir()
 	}
 	return filepath.Join(dir, fmt.Sprintf("acp-multiplex-%d.sock", os.Getpid()))
+}
+
+// cleanStaleSockets removes acp-multiplex sockets whose owning process is dead.
+func cleanStaleSockets() {
+	dir := os.Getenv("XDG_RUNTIME_DIR")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "acp-multiplex-") || !strings.HasSuffix(name, ".sock") {
+			continue
+		}
+		pidStr := strings.TrimPrefix(name, "acp-multiplex-")
+		pidStr = strings.TrimSuffix(pidStr, ".sock")
+		pid, err := strconv.Atoi(pidStr)
+		if err != nil {
+			continue
+		}
+		// Signal 0 checks if process exists without actually signaling it.
+		if err := syscall.Kill(pid, 0); err != nil {
+			os.Remove(filepath.Join(dir, name))
+		}
+	}
 }
 
 func listenUnix(path string) (net.Listener, error) {
