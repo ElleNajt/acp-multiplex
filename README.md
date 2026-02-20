@@ -1,33 +1,37 @@
 # acp-multiplex
 
-Multiplexing proxy for [ACP](https://github.com/agentclientprotocol/agent-client-protocol) agents. Allows multiple frontends to share a single agent session.
+Multiplexing proxy for [ACP](https://github.com/agentclientprotocol/agent-client-protocol) agents.
+
+ACP is the protocol between a frontend and an AI agent, using JSON-RPC over stdin/stdout. It's 1:1 — one frontend, one agent. acp-multiplex makes it 1:N, so multiple frontends can share a single agent session.
+
+The main use case: you run Claude agents via [agent-shell](https://github.com/xenodium/agent-shell) in Emacs, and you also want to see and interact with those sessions from your phone via [acp-mobile](https://github.com/ElleNajt/acp-mobile).
 
 ## How it works
 
 ```
-                    ACP Agent (e.g. claude-code-acp)
-                         stdin/stdout
-                              |
-                     ┌────────┴────────┐
-                     │  acp-multiplex  │
-                     │                 │
-                     │  - ID rewriting │
-                     │  - Fan-out      │
-                     │  - Replay cache │
-                     └──┬─────────┬────┘
-                        │         │
-               stdin/stdout    Unix socket
-               (primary)       (secondary)
-                  │               │
-              agent-shell     acp-mobile
-              or Toad
+              Emacs (agent-shell)
+                  stdin/stdout
+                       |
+                 acp-multiplex  ←→  claude-code-acp
+                       |
+                   Unix socket
+                       |
+                   acp-mobile (phone)
 ```
 
-A primary frontend ([agent-shell](https://github.com/xenodium/agent-shell), Toad, etc.) spawns the proxy and talks to it on stdin/stdout. Secondary frontends like [acp-mobile](https://github.com/ElleNajt/acp-mobile) connect via Unix socket and get a full replay of the session history.
+1. Emacs starts `acp-multiplex claude-code-acp`. The proxy spawns the agent as a subprocess and creates a Unix socket at `$TMPDIR/acp-multiplex/<pid>.sock`.
 
-The proxy rewrites JSON-RPC message IDs so multiple frontends can use overlapping ID spaces. Notifications are broadcast to all frontends. Responses are routed back to the specific frontend that sent the request.
+2. Emacs talks to the proxy on stdin/stdout. It has no idea the proxy is there — it thinks it's talking directly to the agent.
 
-When a frontend sends `session/prompt`, the proxy synthesizes `user_message_chunk` notifications so other frontends see what was typed.
+3. When Emacs sends a request (say `session/prompt` with id 1), the proxy rewrites the id to a unique internal id (say 7), remembers "id 7 came from Emacs, originally id 1", and forwards it to the agent.
+
+4. When the agent responds with id 7, the proxy looks up the mapping, rewrites the id back to 1, and sends it only to Emacs.
+
+5. When the agent sends notifications (streaming text, tool calls, etc.), the proxy broadcasts them to all connected frontends and stores them in a cache.
+
+6. When acp-mobile connects to the Unix socket, it gets a replay of the cached history — the initialize response, session/new response, and all notifications (with streaming chunks coalesced into complete messages so replay is fast). Then it receives live updates.
+
+7. acp-mobile can also send prompts. The proxy rewrites its ids the same way, and synthesizes `user_message_chunk` notifications so Emacs sees what was typed from the phone.
 
 ## Socket directory
 
