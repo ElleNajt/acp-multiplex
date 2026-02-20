@@ -78,7 +78,6 @@ func runProxy() {
 			nextID++
 			f := NewSocketFrontend(nextID, conn)
 			proxy.AddFrontend(f)
-			log.Printf("frontend %d connected", nextID)
 		}
 	}()
 

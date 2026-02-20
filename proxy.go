@@ -60,7 +60,6 @@ func (p *Proxy) AddFrontend(f *Frontend) {
 	go func() {
 		<-f.done
 		p.RemoveFrontend(f)
-		log.Printf("frontend %d disconnected", f.id)
 	}()
 
 	// Replay cached history for non-primary frontends.
