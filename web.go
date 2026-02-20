@@ -25,9 +25,15 @@ func serveWeb(sockPath string, port string) {
 		w.Write([]byte(indexHTML))
 	})
 
-	mux.Handle("/ws", websocket.Handler(func(ws *websocket.Conn) {
-		handleWebSocket(ws, sockPath)
-	}))
+	mux.Handle("/ws", &websocket.Server{
+		Handler: func(ws *websocket.Conn) {
+			handleWebSocket(ws, sockPath)
+		},
+		Handshake: func(config *websocket.Config, r *http.Request) error {
+			config.Origin, _ = websocket.Origin(config, r)
+			return nil // accept any origin (localhost only)
+		},
+	})
 
 	addr := fmt.Sprintf("127.0.0.1:%s", port)
 	log.Printf("web UI: http://%s", addr)
