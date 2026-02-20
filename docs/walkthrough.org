@@ -1,0 +1,667 @@
+#+TITLE: acp-multiplex: a code walkthrough
+#+AUTHOR: Elle & Claude
+
+* Overview
+
+ACP (Agent Client Protocol) is JSON-RPC 2.0 over stdin/stdout between a frontend and an AI agent. It's 1:1 — one frontend, one agent. acp-multiplex sits between them and makes it 1:N.
+
+#+begin_example
+            Primary frontend
+               stdin/stdout
+                    |
+              acp-multiplex  <-->  agent (e.g. claude-code-acp)
+                    |
+                Unix socket
+                    |
+            Secondary frontend(s)
+#+end_example
+
+The primary frontend (e.g. an editor) launches ~acp-multiplex <agent-command>~. The proxy spawns the agent as a subprocess and creates a Unix socket. Secondary frontends connect to that socket and get the full session history replayed, then receive live updates.
+
+All messages are ndjson (newline-delimited JSON). The proxy never interprets the /contents/ of messages — it only looks at the JSON-RPC envelope fields (~id~, ~method~) to decide where to route them.
+
+The code is five files. We'll walk through them following the path a message takes.
+
+* The message envelope (~message.go~)
+
+Everything starts with the JSON-RPC 2.0 envelope. Every ACP message has this shape:
+
+#+begin_src go
+type Envelope struct {
+    JSONRPC string           `json:"jsonrpc"`
+    ID      *json.RawMessage `json:"id,omitempty"`
+    Method  string           `json:"method,omitempty"`
+    Params  json.RawMessage  `json:"params,omitempty"`
+    Result  json.RawMessage  `json:"result,omitempty"`
+    Error   json.RawMessage  `json:"error,omitempty"`
+}
+#+end_src
+
+Notice that ~Params~, ~Result~, and ~Error~ are ~json.RawMessage~ — raw bytes. The proxy never unmarshals them. It only needs two fields to route messages: ~ID~ and ~Method~.
+
+** Classification
+
+JSON-RPC 2.0 has three message kinds. You can tell them apart by which fields are present:
+
+#+begin_src go
+type MessageKind int
+
+const (
+    KindRequest      MessageKind = iota // has method + id
+    KindNotification                    // has method, no id
+    KindResponse                        // has id, no method
+    KindInvalid
+)
+
+func classify(env *Envelope) MessageKind {
+    hasMethod := env.Method != ""
+    hasID := env.ID != nil
+    switch {
+    case hasMethod && hasID:
+        return KindRequest
+    case hasMethod && !hasID:
+        return KindNotification
+    case !hasMethod && hasID:
+        return KindResponse
+    default:
+        return KindInvalid
+    }
+}
+#+end_src
+
+- *Request*: has ~method~ and ~id~. The sender expects a response with the same ~id~.
+- *Notification*: has ~method~ but no ~id~. Fire-and-forget.
+- *Response*: has ~id~ but no ~method~. This is the reply to a request.
+
+** ID rewriting
+
+This is the key trick. Two frontends might both send a request with ~id: 1~. The agent would see two requests with the same id and get confused. So the proxy rewrites IDs:
+
+#+begin_src go
+func rewriteID(line []byte, newID int64) ([]byte, error) {
+    var raw map[string]json.RawMessage
+    if err := json.Unmarshal(line, &raw); err != nil {
+        return nil, err
+    }
+    idBytes, err := json.Marshal(newID)
+    if err != nil {
+        return nil, err
+    }
+    raw["id"] = json.RawMessage(idBytes)
+    return json.Marshal(raw)
+}
+#+end_src
+
+And when the response comes back, restore the original:
+
+#+begin_src go
+func restoreID(line []byte, origID json.RawMessage) ([]byte, error) {
+    var raw map[string]json.RawMessage
+    if err := json.Unmarshal(line, &raw); err != nil {
+        return nil, err
+    }
+    raw["id"] = origID
+    return json.Marshal(raw)
+}
+#+end_src
+
+The proxy keeps a monotonically increasing counter. Frontend A sends ~id:1~, proxy rewrites to ~id:7~, remembers "7 -> (Frontend A, original id 1)". Frontend B sends ~id:1~, proxy rewrites to ~id:8~. The agent sees 7 and 8 — no collision.
+
+* The frontend abstraction (~frontend.go~)
+
+A ~Frontend~ is anything that sends and receives ndjson lines. The proxy doesn't care if it's stdin/stdout or a Unix socket.
+
+#+begin_src go
+type Frontend struct {
+    id      int
+    primary bool
+    scanner *bufio.Scanner
+    writer  io.Writer
+    mu      sync.Mutex
+    done    chan struct{}
+}
+#+end_src
+
+~primary~ marks the stdin/stdout frontend. This matters for two things: the primary doesn't get history replayed (it was there from the start), and reverse calls from the agent (file reads, permission requests) go to the primary only.
+
+Two constructors, same interface:
+
+#+begin_src go
+func NewStdioFrontend(id int) *Frontend {
+    scanner := bufio.NewScanner(os.Stdin)
+    scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+    return &Frontend{
+        id:      id,
+        primary: true,
+        scanner: scanner,
+        writer:  os.Stdout,
+        done:    make(chan struct{}),
+    }
+}
+
+func NewSocketFrontend(id int, conn net.Conn) *Frontend {
+    scanner := bufio.NewScanner(conn)
+    scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+    return &Frontend{
+        id:      id,
+        primary: false,
+        scanner: scanner,
+        writer:  conn,
+        done:    make(chan struct{}),
+    }
+}
+#+end_src
+
+A ~net.Conn~ satisfies ~io.Writer~, so the socket connection is used directly as the writer. Go interfaces are implicit — no ~implements~ keyword needed.
+
+** Reading and sending
+
+All frontends feed into a single channel:
+
+#+begin_src go
+type FrontendMessage struct {
+    Frontend *Frontend
+    Line     []byte
+}
+
+func (f *Frontend) ReadLines(ch chan<- FrontendMessage) {
+    defer close(f.done)
+    for f.scanner.Scan() {
+        line := make([]byte, len(f.scanner.Bytes()))
+        copy(line, f.scanner.Bytes())
+        ch <- FrontendMessage{Frontend: f, Line: line}
+    }
+}
+#+end_src
+
+Each frontend gets its own goroutine running ~ReadLines~. They all write to the same ~fromFrontends~ channel. The proxy reads from that one channel — it doesn't need to poll or select across multiple sources.
+
+Sending is mutex-protected because multiple goroutines might send to the same frontend concurrently (e.g. the agent sends a notification while a replay is in progress):
+
+#+begin_src go
+func (f *Frontend) Send(line []byte) {
+    f.mu.Lock()
+    defer f.mu.Unlock()
+    f.writer.Write(line)
+    f.writer.Write([]byte("\n"))
+}
+#+end_src
+
+* The proxy core (~proxy.go~)
+
+This is the heart of the multiplexer. It has two read loops running concurrently:
+
+#+begin_src go
+func (p *Proxy) Run() {
+    go p.readFromFrontends()
+    p.readFromAgent() // blocks
+}
+#+end_src
+
+~readFromAgent~ blocks the goroutine (it's the main loop). ~readFromFrontends~ runs in a separate goroutine.
+
+** Agent -> frontends
+
+The agent sends three kinds of messages. Each is handled differently:
+
+#+begin_src go
+func (p *Proxy) readFromAgent() {
+    for p.agentOut.Scan() {
+        line := make([]byte, len(p.agentOut.Bytes()))
+        copy(line, p.agentOut.Bytes())
+
+        env, err := parseEnvelope(line)
+        if err != nil {
+            log.Printf("agent: bad json: %v", err)
+            continue
+        }
+
+        kind := classify(env)
+        switch kind {
+        case KindNotification:
+            if env.Method == "session/update" {
+                p.cache.AddUpdate(line)
+            }
+            p.broadcast(line)
+
+        case KindResponse:
+            p.routeResponseToFrontend(env, line)
+
+        case KindRequest:
+            p.routeReverseCall(line)
+        }
+    }
+}
+#+end_src
+
+*** Notifications: broadcast to everyone
+
+~session/update~ notifications (streaming text, tool calls, etc.) go to /all/ connected frontends and get cached for late joiners.
+
+*** Responses: route back to the sender
+
+When the agent responds to a request, only the frontend that sent the request should get the response. The proxy looks up which frontend sent it using the rewritten ID:
+
+#+begin_src go
+func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
+    var proxyID int64
+    if err := json.Unmarshal(*env.ID, &proxyID); err != nil {
+        log.Printf("agent response with non-numeric id, forwarding to primary")
+        p.sendToPrimary(line)
+        return
+    }
+
+    val, ok := p.pending.LoadAndDelete(proxyID)
+    if !ok {
+        log.Printf("agent response for unknown id %d", proxyID)
+        return
+    }
+    pr := val.(*PendingRequest)
+
+    // Cache initialize and session/new responses for replay
+    switch pr.method {
+    case "initialize":
+        rewritten, err := rewriteID(line, 0)
+        if err == nil {
+            p.cache.SetInitResponse(rewritten)
+        }
+    case "session/new":
+        rewritten, err := rewriteID(line, 0)
+        if err == nil {
+            p.cache.SetNewResponse(rewritten)
+        }
+    }
+
+    // Synthesize turn_complete for other frontends
+    if pr.method == "session/prompt" {
+        p.synthesizeTurnComplete(line, pr.frontend)
+    }
+
+    // Rewrite ID back and send to the original sender
+    rewritten, err := restoreID(line, pr.originalID)
+    if err != nil {
+        log.Printf("failed to restore id: %v", err)
+        return
+    }
+    pr.frontend.Send(rewritten)
+}
+#+end_src
+
+~p.pending~ is a ~sync.Map~ — a concurrent map from proxy ID to ~PendingRequest~. ~LoadAndDelete~ atomically retrieves and removes the entry.
+
+*** Reverse calls: primary only
+
+The agent can also /send/ requests to the frontend — file reads (~fs/*~), terminal commands (~terminal/*~), permission requests (~session/requestPermission~). These go only to the primary frontend:
+
+#+begin_src go
+func (p *Proxy) routeReverseCall(line []byte) {
+    p.sendToPrimary(line)
+}
+#+end_src
+
+** Frontends -> agent
+
+Messages from frontends are read from the shared channel:
+
+#+begin_src go
+func (p *Proxy) readFromFrontends() {
+    for msg := range p.fromFrontends {
+        env, err := parseEnvelope(msg.Line)
+        if err != nil {
+            continue
+        }
+
+        kind := classify(env)
+        switch kind {
+        case KindRequest:
+            p.handleFrontendRequest(msg.Frontend, env, msg.Line)
+        case KindNotification:
+            p.sendToAgent(msg.Line)
+        case KindResponse:
+            p.sendToAgent(msg.Line)
+        }
+    }
+}
+#+end_src
+
+Notifications and responses pass through unchanged. Requests get ID-rewritten:
+
+#+begin_src go
+func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
+    proxyID := p.nextID.Add(1) - 1
+
+    var origID json.RawMessage
+    if env.ID != nil {
+        origID = append(json.RawMessage(nil), *env.ID...)
+    }
+    p.pending.Store(proxyID, &PendingRequest{
+        originalID: origID,
+        frontend:   f,
+        method:     env.Method,
+    })
+
+    rewritten, err := rewriteID(line, proxyID)
+    if err != nil {
+        log.Printf("failed to rewrite id: %v", err)
+        return
+    }
+
+    if env.Method == "session/prompt" {
+        p.synthesizeUserMessage(env, f)
+    }
+
+    p.sendToAgent(rewritten)
+}
+#+end_src
+
+** Synthesized messages
+
+The proxy creates two kinds of messages that the agent never sends:
+
+*** ~user_message_chunk~
+
+When a frontend sends a prompt, the other frontends don't see it — they only see the agent's response. So the proxy extracts the prompt content and broadcasts it as ~user_message_chunk~ notifications:
+
+#+begin_src go
+func (p *Proxy) synthesizeUserMessage(env *Envelope, sender *Frontend) {
+    var params struct {
+        SessionID string            `json:"sessionId"`
+        Prompt    []json.RawMessage `json:"prompt"`
+    }
+    if err := json.Unmarshal(env.Params, &params); err != nil {
+        return
+    }
+
+    for _, block := range params.Prompt {
+        notif := map[string]interface{}{
+            "jsonrpc": "2.0",
+            "method":  "session/update",
+            "params": map[string]interface{}{
+                "sessionId": params.SessionID,
+                "update": map[string]interface{}{
+                    "sessionUpdate": "user_message_chunk",
+                    "content":       json.RawMessage(block),
+                },
+            },
+        }
+        line, _ := json.Marshal(notif)
+        p.cache.AddUpdate(line)
+        p.broadcastExcept(line, sender)
+    }
+}
+#+end_src
+
+The sender is excluded — its UI already shows what the user typed.
+
+*** ~turn_complete~
+
+When the agent finishes responding, it sends a ~session/prompt~ /response/ (with ~stopReason~). But only the requesting frontend gets that response. Other frontends see streaming notifications and then... nothing. They don't know the turn ended.
+
+So the proxy synthesizes a ~turn_complete~ notification:
+
+#+begin_src go
+func (p *Proxy) synthesizeTurnComplete(responseLine []byte, sender *Frontend) {
+    var resp struct {
+        Result struct {
+            StopReason string `json:"stopReason"`
+            SessionID  string `json:"sessionId"`
+        } `json:"result"`
+    }
+    if err := json.Unmarshal(responseLine, &resp); err != nil {
+        return
+    }
+
+    if resp.Result.StopReason == "" {
+        return
+    }
+
+    notif := map[string]interface{}{
+        "jsonrpc": "2.0",
+        "method":  "session/update",
+        "params": map[string]interface{}{
+            "sessionId": resp.Result.SessionID,
+            "update": map[string]interface{}{
+                "sessionUpdate": "turn_complete",
+                "stopReason":    resp.Result.StopReason,
+            },
+        },
+    }
+    line, _ := json.Marshal(notif)
+    p.cache.AddUpdate(line)
+    go p.broadcastExcept(line, sender)
+}
+#+end_src
+
+** Adding and removing frontends
+
+When a new frontend connects, it starts reading and gets a replay if it's secondary:
+
+#+begin_src go
+func (p *Proxy) AddFrontend(f *Frontend) {
+    p.mu.Lock()
+    p.frontends = append(p.frontends, f)
+    p.mu.Unlock()
+
+    go f.ReadLines(p.fromFrontends)
+
+    go func() {
+        <-f.done
+        p.RemoveFrontend(f)
+    }()
+
+    if !f.primary {
+        go p.cache.Replay(f)
+    }
+}
+#+end_src
+
+~<-f.done~ blocks until the ~done~ channel is closed, which happens when ~ReadLines~ exits (connection closed / EOF). This is Go's idiom for "wait for this thing to finish."
+
+* The replay cache (~cache.go~)
+
+When a secondary frontend connects, it needs to catch up on the session history. The cache stores:
+
+- An optional metadata message (session name)
+- The ~initialize~ response
+- The ~session/new~ response
+- All ~session/update~ notifications
+
+#+begin_src go
+type Cache struct {
+    mu       sync.Mutex
+    meta     []byte
+    initResp []byte
+    newResp  []byte
+    updates  [][]byte
+
+    chunkType string
+    chunkText string
+    chunkMeta updateMeta
+}
+#+end_src
+
+** Chunk coalescing
+
+The agent streams text in many small chunks — ~agent_message_chunk~ and ~agent_thought_chunk~ notifications, each with a few characters. Replaying hundreds of tiny chunks to a late joiner is wasteful. The cache coalesces consecutive chunks of the same type into a single message:
+
+#+begin_src go
+func (c *Cache) AddUpdate(line []byte) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    kind, text, sessionID := parseUpdateType(line)
+
+    switch kind {
+    case "agent_message_chunk", "agent_thought_chunk":
+        if c.chunkType == kind {
+            // Same chunk type -- accumulate
+            c.chunkText += text
+        } else {
+            // Different type -- flush previous, start new
+            c.flushChunks()
+            c.chunkType = kind
+            c.chunkText = text
+            c.chunkMeta = updateMeta{SessionID: sessionID}
+        }
+    default:
+        // Non-chunk update -- flush any pending chunks, then store
+        c.flushChunks()
+        c.updates = append(c.updates, append([]byte(nil), line...))
+    }
+}
+#+end_src
+
+So if the agent sends 200 ~agent_message_chunk~ notifications, the cache stores them as one coalesced message with the full text concatenated. When a tool call or other non-chunk update arrives, it flushes the accumulated text first.
+
+** Replay
+
+Replay sends everything in order: metadata, init, session/new, then all updates:
+
+#+begin_src go
+func (c *Cache) Replay(f *Frontend) {
+    c.mu.Lock()
+    c.flushChunks()
+
+    initResp := c.initResp
+    newResp := c.newResp
+    meta := c.meta
+    updates := make([][]byte, len(c.updates))
+    copy(updates, c.updates)
+    c.mu.Unlock()
+
+    if meta != nil {
+        f.Send(meta)
+    }
+    if initResp != nil {
+        f.Send(initResp)
+    }
+    if newResp != nil {
+        f.Send(newResp)
+    }
+    for _, u := range updates {
+        f.Send(u)
+    }
+}
+#+end_src
+
+It snapshots the data under the lock, then sends without holding the lock — so new messages from the agent aren't blocked during a slow replay.
+
+* Startup and socket lifecycle (~main.go~)
+
+** Proxy mode
+
+~main.go~ handles two modes. The default starts the agent and proxy:
+
+#+begin_src go
+func runProxy() {
+    cleanStaleSockets()
+
+    agentArgs := os.Args[1:]
+    cmd := exec.Command(agentArgs[0], agentArgs[1:]...)
+    agentIn, _ := cmd.StdinPipe()
+    agentOut, _ := cmd.StdoutPipe()
+    cmd.Stderr = os.Stderr
+
+    cmd.Start()
+
+    cache := NewCache()
+    proxy := NewProxy(agentIn, agentOut, cache)
+
+    // Primary frontend on stdin/stdout
+    primary := NewStdioFrontend(0)
+    proxy.AddFrontend(primary)
+
+    // Unix socket for additional frontends
+    sockPath := socketPath()
+    ln, _ := listenUnix(sockPath)
+    defer os.Remove(sockPath)
+
+    // Accept loop for secondary frontends
+    go func() {
+        for {
+            conn, _ := ln.Accept()
+            nextID++
+            f := NewSocketFrontend(nextID, conn)
+            proxy.AddFrontend(f)
+        }
+    }()
+
+    go proxy.Run()
+    cmd.Wait()
+}
+#+end_src
+
+(Error handling omitted for clarity — the real code checks every error.)
+
+The agent's stderr is passed through to the proxy's stderr, so agent log messages are visible.
+
+** Socket discovery
+
+Sockets live in ~$TMPDIR/acp-multiplex/~, named by PID:
+
+#+begin_src go
+func socketPath() string {
+    return filepath.Join(socketDir(), fmt.Sprintf("%d.sock", os.Getpid()))
+}
+#+end_src
+
+On startup, stale sockets from dead processes are cleaned up:
+
+#+begin_src go
+func cleanStaleSockets() {
+    dir := socketDir()
+    entries, _ := os.ReadDir(dir)
+    for _, e := range entries {
+        name := e.Name()
+        if !strings.HasSuffix(name, ".sock") {
+            continue
+        }
+        pidStr := strings.TrimSuffix(name, ".sock")
+        pid, err := strconv.Atoi(pidStr)
+        if err != nil {
+            continue
+        }
+        if err := syscall.Kill(pid, 0); err != nil {
+            os.Remove(filepath.Join(dir, name))
+        }
+    }
+}
+#+end_src
+
+~syscall.Kill(pid, 0)~ sends signal 0 — it doesn't actually kill the process, just checks if it exists. If the process is dead, the socket is stale and gets removed.
+
+** Attach mode
+
+Attach mode bridges stdin/stdout to an existing proxy's socket. This lets any stdio ACP client become a secondary frontend:
+
+#+begin_src go
+func runAttach() {
+    sockPath := os.Args[2]
+    conn, _ := net.Dial("unix", sockPath)
+    defer conn.Close()
+
+    done := make(chan struct{}, 2)
+    go func() { io.Copy(conn, os.Stdin); done <- struct{}{} }()
+    go func() { io.Copy(os.Stdout, conn); done <- struct{}{} }()
+    <-done
+}
+#+end_src
+
+Two goroutines, two ~io.Copy~ calls — one for each direction. When either side closes, we're done. That's the entire attach implementation.
+
+** Session naming
+
+If the ~ACP_MULTIPLEX_NAME~ environment variable is set, the proxy caches a metadata notification so secondary frontends can discover the session name:
+
+#+begin_src go
+if name := os.Getenv("ACP_MULTIPLEX_NAME"); name != "" {
+    meta, _ := json.Marshal(map[string]interface{}{
+        "jsonrpc": "2.0",
+        "method":  "acp-multiplex/meta",
+        "params":  map[string]string{"name": name},
+    })
+    cache.SetMeta(meta)
+}
+#+end_src
+
+This is the first thing replayed to a connecting secondary frontend, before the initialize response.
