@@ -17,15 +17,13 @@ Multiplexing proxy for [ACP](https://github.com/agentclientprotocol/agent-client
                      └──┬─────────┬────┘
                         │         │
                stdin/stdout    Unix socket
-               (primary)       (secondary frontends)
+               (primary)       (secondary)
                   │               │
-                  │         ┌─────┼─────┐
-                  │         │     │     │
-              agent-shell  Toad  web   attach
-              (Emacs)            app   client
+              agent-shell     acp-mobile
+              or Toad
 ```
 
-The primary frontend (typically [agent-shell](https://github.com/xenodium/agent-shell) in Emacs) talks to the proxy on stdin/stdout. Secondary frontends connect via a Unix socket and get a full replay of the session history.
+A primary frontend ([agent-shell](https://github.com/xenodium/agent-shell), Toad, etc.) spawns the proxy and talks to it on stdin/stdout. Secondary frontends like [acp-mobile](https://github.com/ElleNajt/acp-mobile) connect via Unix socket and get a full replay of the session history.
 
 The proxy rewrites JSON-RPC message IDs so multiple frontends can use overlapping ID spaces. Notifications are broadcast to all frontends. Responses are routed back to the specific frontend that sent the request.
 
@@ -41,45 +39,45 @@ $TMPDIR/acp-multiplex/
   67890.sock
 ```
 
-Stale sockets from dead processes are cleaned up on proxy startup. External apps discover sessions by listing this directory and checking liveness with `kill -0 <pid>`.
+Stale sockets from dead processes are cleaned up on proxy startup. Secondary frontends discover sessions by listing this directory and checking liveness with `kill -0 <pid>`.
 
 ## Usage
 
-### agent-shell (Emacs)
+### Primary frontends
 
-The primary use case. Set the command in your Emacs config:
+#### agent-shell (Emacs)
 
 ```elisp
 (setq agent-shell-anthropic-claude-command '("acp-multiplex" "claude-code-acp"))
 ```
 
-agent-shell talks ACP on stdin/stdout as usual — it doesn't know the multiplexer is there. A Unix socket is created for secondary frontends to attach.
+agent-shell talks ACP on stdin/stdout as usual — it doesn't know the multiplexer is there.
 
-### Toad
+#### Toad
 
 ```bash
-# As primary frontend
 toad acp acp-multiplex claude-code-acp
-
-# As secondary frontend (attaching to an existing session)
-toad acp "acp-multiplex attach $TMPDIR/acp-multiplex/12345.sock" .
 ```
 
-### Attach (any stdio ACP client)
+#### Standalone
+
+```bash
+acp-multiplex claude-code-acp
+```
+
+### Secondary frontends
+
+#### acp-mobile
+
+[acp-mobile](https://github.com/ElleNajt/acp-mobile) discovers sockets in the socket directory and connects via WebSocket bridge.
+
+#### Attach (any stdio ACP client)
 
 ```bash
 acp-multiplex attach $TMPDIR/acp-multiplex/12345.sock
 ```
 
 Bridges stdin/stdout to an existing proxy's Unix socket.
-
-### Standalone
-
-```bash
-acp-multiplex claude-code-acp
-```
-
-Spawns the agent, creates a primary frontend on stdin/stdout, and listens on a Unix socket.
 
 ## Building
 
