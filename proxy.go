@@ -28,8 +28,9 @@ type Proxy struct {
 	mu        sync.Mutex
 	frontends []*Frontend
 
-	nextID  atomic.Int64
-	pending sync.Map // proxyID (int64) -> *PendingRequest
+	nextID         atomic.Int64
+	pending        sync.Map // proxyID (int64) -> *PendingRequest
+	pendingReverse sync.Map // agent request ID (string) -> struct{}
 
 	cache *Cache
 
@@ -162,8 +163,8 @@ func (p *Proxy) readFromAgent() {
 
 		case KindRequest:
 			// Reverse call from agent (fs/*, terminal/*, session/requestPermission).
-			// Route to primary frontend.
-			p.routeReverseCall(line)
+			// Broadcast to all frontends; first response wins.
+			p.routeReverseCall(env, line)
 
 		default:
 			log.Printf("agent: unclassifiable message")
@@ -225,9 +226,13 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 	pr.frontend.Send(rewritten)
 }
 
-// routeReverseCall sends an agent-initiated request to the primary frontend.
-func (p *Proxy) routeReverseCall(line []byte) {
-	p.sendToPrimary(line)
+// routeReverseCall broadcasts an agent-initiated request to all frontends.
+// The first frontend to respond wins; subsequent responses are dropped.
+func (p *Proxy) routeReverseCall(env *Envelope, line []byte) {
+	if env.ID != nil {
+		p.pendingReverse.Store(string(*env.ID), struct{}{})
+	}
+	p.broadcast(line)
 }
 
 func (p *Proxy) sendToPrimary(line []byte) {
@@ -267,8 +272,14 @@ func (p *Proxy) readFromFrontends() {
 			p.sendToAgent(msg.Line)
 
 		case KindResponse:
-			// Response to a reverse call — forward directly to agent
-			p.sendToAgent(msg.Line)
+			// Response to a reverse call — first response wins, drop duplicates.
+			if env.ID != nil {
+				idKey := string(*env.ID)
+				if _, loaded := p.pendingReverse.LoadAndDelete(idKey); loaded {
+					p.sendToAgent(msg.Line)
+				}
+				// else: duplicate response from another frontend, drop it
+			}
 
 		default:
 			log.Printf("frontend %d: unclassifiable message", msg.Frontend.id)
