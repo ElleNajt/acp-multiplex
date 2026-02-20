@@ -65,6 +65,7 @@ func runProxy() {
 	}
 
 	proxy := NewProxy(agentIn, agentOut, cache)
+	proxy.sockPath = socketPath()
 
 	// Primary frontend on stdin/stdout
 	primary := NewStdioFrontend(0)

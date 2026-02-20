@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // PendingRequest tracks a request forwarded to the agent so we can
@@ -33,6 +35,10 @@ type Proxy struct {
 
 	// Channel for messages from all frontends
 	fromFrontends chan FrontendMessage
+
+	// Socket path for mtime updates (optional)
+	sockPath  string
+	lastTouch atomic.Int64 // unix timestamp of last touch
 }
 
 func NewProxy(agentIn io.Writer, agentOut io.Reader, cache *Cache) *Proxy {
@@ -46,6 +52,20 @@ func NewProxy(agentIn io.Writer, agentOut io.Reader, cache *Cache) *Proxy {
 	}
 	p.nextID.Store(1)
 	return p
+}
+
+// touchSocket updates the socket file's mtime so external tools (e.g. acp-mobile)
+// can see when a session was last active. Rate-limited to once per second.
+func (p *Proxy) touchSocket() {
+	if p.sockPath == "" {
+		return
+	}
+	now := time.Now().Unix()
+	if p.lastTouch.Load() == now {
+		return
+	}
+	p.lastTouch.Store(now)
+	os.Chtimes(p.sockPath, time.Now(), time.Now())
 }
 
 func (p *Proxy) AddFrontend(f *Frontend) {
@@ -124,6 +144,8 @@ func (p *Proxy) readFromAgent() {
 			log.Printf("agent: bad json: %v", err)
 			continue
 		}
+
+		p.touchSocket()
 
 		kind := classify(env)
 		switch kind {
