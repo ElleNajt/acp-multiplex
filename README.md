@@ -96,7 +96,7 @@ go build -o acp-multiplex .
 go test -v -run TestProxy
 
 # End-to-end test (requires claude-code-acp in PATH)
-python3 test_e2e.py
+python3 scripts/test_e2e.py
 ```
 
 ## Architecture
