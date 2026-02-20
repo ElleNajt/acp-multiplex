@@ -29,8 +29,6 @@ type Proxy struct {
 	nextID  atomic.Int64
 	pending sync.Map // proxyID (int64) -> *PendingRequest
 
-	promptMu sync.Mutex // serialize session/prompt turns
-
 	cache *Cache
 
 	// Channel for messages from all frontends
@@ -187,20 +185,6 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 	case "session/new":
 		rewritten, err := rewriteID(line, 0)
 		if err == nil {
-			// Inject cwd into the response so replayed clients can find it.
-			if cwd := p.cache.Cwd(); cwd != "" {
-				var raw map[string]json.RawMessage
-				if err2 := json.Unmarshal(rewritten, &raw); err2 == nil {
-					if result, ok := raw["result"]; ok {
-						var res map[string]json.RawMessage
-						if err3 := json.Unmarshal(result, &res); err3 == nil {
-							res["cwd"], _ = json.Marshal(cwd)
-							raw["result"], _ = json.Marshal(res)
-							rewritten, _ = json.Marshal(raw)
-						}
-					}
-				}
-			}
 			p.cache.SetNewResponse(rewritten)
 		}
 	}
@@ -288,16 +272,6 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 		return
 	}
 
-	// Extract cwd from session/new requests for the file browser.
-	if env.Method == "session/new" {
-		var params struct {
-			Cwd string `json:"cwd"`
-		}
-		if err := json.Unmarshal(env.Params, &params); err == nil && params.Cwd != "" {
-			p.cache.SetCwd(params.Cwd)
-		}
-	}
-
 	// Synthesize user_message_chunk notifications for session/prompt
 	// so all frontends (and the replay cache) see what was typed.
 	// Skip the sender — their UI already shows the user's input.
@@ -305,17 +279,7 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 		p.synthesizeUserMessage(env, f)
 	}
 
-	// Serialize prompts — only one at a time
-	if env.Method == "session/prompt" {
-		p.promptMu.Lock()
-		p.sendToAgent(rewritten)
-		// We release promptMu when we get the response — but that's
-		// complex to wire up. For now, release immediately and rely
-		// on frontends behaving. TODO: proper prompt serialization.
-		p.promptMu.Unlock()
-	} else {
-		p.sendToAgent(rewritten)
-	}
+	p.sendToAgent(rewritten)
 }
 
 // synthesizeUserMessage extracts prompt content blocks from a session/prompt
