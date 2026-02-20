@@ -188,10 +188,20 @@ func TestProxyFanOut(t *testing.T) {
 	t.Logf("replay 2: %s", replayLine2)
 
 	// Send a prompt from frontend 1
-	promptReq := `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"test-session-1","content":[{"type":"text","text":"hello"}]}}`
+	promptReq := `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"test-session-1","prompt":[{"type":"text","text":"hello"}]}}`
 	fe1W.Write([]byte(promptReq + "\n"))
 
-	// Both frontends should get the session/update notification
+	// Frontend 2 (non-sender) should get the synthesized user_message_chunk.
+	// Frontend 1 (sender) should NOT — its UI already shows the input.
+	userUpdate2 := readLine(t, fe2Scanner, 2*time.Second)
+
+	var uu2 map[string]interface{}
+	json.Unmarshal(userUpdate2, &uu2)
+	if uu2["method"] != "session/update" {
+		t.Errorf("frontend 2: expected user_message_chunk session/update, got %s", userUpdate2)
+	}
+
+	// Both frontends should get the agent's session/update notification
 	update1 := readLine(t, fe1Scanner, 2*time.Second)
 	update2 := readLine(t, fe2Scanner, 2*time.Second)
 
@@ -200,10 +210,10 @@ func TestProxyFanOut(t *testing.T) {
 	json.Unmarshal(update2, &u2)
 
 	if u1["method"] != "session/update" {
-		t.Errorf("frontend 1: expected session/update, got %s", update1)
+		t.Errorf("frontend 1: expected agent session/update, got %s", update1)
 	}
 	if u2["method"] != "session/update" {
-		t.Errorf("frontend 2: expected session/update, got %s", update2)
+		t.Errorf("frontend 2: expected agent session/update, got %s", update2)
 	}
 
 	// Frontend 1 should also get the prompt response

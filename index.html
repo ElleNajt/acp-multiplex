@@ -147,19 +147,23 @@ function handleMessage(msg) {
     if (kind === 'agent_message_chunk') {
       if (!sessionId && msg.params.sessionId) sessionId = msg.params.sessionId;
       if (!sendBtn.disabled && sessionId) sendBtn.disabled = false;
-      const text = update.text || '';
+      const text = (update.content && update.content.text) || update.text || '';
       if (!currentAgentMsg) {
         currentAgentMsg = addMsg('agent', '');
       }
       currentAgentMsg.innerHTML += escHtml(text);
     } else if (kind === 'agent_thought_chunk') {
-      const text = update.text || '';
+      const text = (update.content && update.content.text) || update.text || '';
       addMsg('thought', escHtml(text));
     } else if (kind === 'tool_call') {
       currentAgentMsg = null;
       addMsg('tool', '[tool: ' + escHtml(update.toolName || '?') + ']');
     } else if (kind === 'tool_call_update') {
       addMsg('tool', '[' + escHtml(update.status || '?') + ']');
+    } else if (kind === 'user_message_chunk') {
+      currentAgentMsg = null;
+      const text = (update.content && update.content.text) || '';
+      if (text) addMsg('user', escHtml(text));
     } else if (kind === 'available_commands_update') {
       // First sign of life — enable input if we have a session
       if (sessionId) sendBtn.disabled = false;
@@ -177,7 +181,6 @@ function sendPrompt() {
   const text = prompt.value.trim();
   if (!text || !sessionId) return;
 
-  addMsg('user', escHtml(text));
   currentAgentMsg = null;
   prompt.value = '';
   prompt.style.height = 'auto';

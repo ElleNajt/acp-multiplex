@@ -86,13 +86,20 @@ func (p *Proxy) sendToAgent(line []byte) {
 
 // broadcast sends a JSON line to all connected frontends.
 func (p *Proxy) broadcast(line []byte) {
+	p.broadcastExcept(line, nil)
+}
+
+// broadcastExcept sends a JSON line to all frontends except the given one.
+func (p *Proxy) broadcastExcept(line []byte, except *Frontend) {
 	p.mu.Lock()
 	fes := make([]*Frontend, len(p.frontends))
 	copy(fes, p.frontends)
 	p.mu.Unlock()
 
 	for _, f := range fes {
-		f.Send(line)
+		if f != except {
+			f.Send(line)
+		}
 	}
 }
 
@@ -260,6 +267,13 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 		return
 	}
 
+	// Synthesize user_message_chunk notifications for session/prompt
+	// so all frontends (and the replay cache) see what was typed.
+	// Skip the sender — their UI already shows the user's input.
+	if env.Method == "session/prompt" {
+		p.synthesizeUserMessage(env, f)
+	}
+
 	// Serialize prompts — only one at a time
 	if env.Method == "session/prompt" {
 		p.promptMu.Lock()
@@ -270,6 +284,44 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 		p.promptMu.Unlock()
 	} else {
 		p.sendToAgent(rewritten)
+	}
+}
+
+// synthesizeUserMessage extracts prompt content blocks from a session/prompt
+// request and broadcasts them as user_message_chunk notifications to all
+// frontends except the sender (whose UI already shows the input), and into
+// the cache for late-joining clients.
+func (p *Proxy) synthesizeUserMessage(env *Envelope, sender *Frontend) {
+	var params struct {
+		SessionID string            `json:"sessionId"`
+		Prompt    []json.RawMessage `json:"prompt"`
+	}
+	if err := json.Unmarshal(env.Params, &params); err != nil {
+		log.Printf("synthesize user msg: parse params: %v", err)
+		return
+	}
+
+	for _, block := range params.Prompt {
+		notif := map[string]interface{}{
+			"jsonrpc": "2.0",
+			"method":  "session/update",
+			"params": map[string]interface{}{
+				"sessionId": params.SessionID,
+				"update": map[string]interface{}{
+					"sessionUpdate": "user_message_chunk",
+					"content":       json.RawMessage(block),
+				},
+			},
+		}
+
+		line, err := json.Marshal(notif)
+		if err != nil {
+			log.Printf("synthesize user msg: marshal: %v", err)
+			continue
+		}
+
+		p.cache.AddUpdate(line)
+		p.broadcastExcept(line, sender)
 	}
 }
 
