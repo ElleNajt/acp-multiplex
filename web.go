@@ -51,7 +51,11 @@ func serveWeb(sockPath string, port string, uiFile string) {
 					ws.Close()
 					return
 				}
+				// Try new location first, then legacy
 				target = filepath.Join(socketDir(), pid+".sock")
+				if _, err := os.Stat(target); err != nil {
+					target = filepath.Join(os.TempDir(), "acp-multiplex-"+pid+".sock")
+				}
 			}
 			handleWebSocket(ws, target)
 		},
@@ -78,16 +82,78 @@ type sessionInfo struct {
 	Cwd       string `json:"cwd,omitempty"`
 }
 
-// handleSessionList scans the socket directory for live proxies,
-// connects briefly to each to read cached session info from the replay.
-func handleSessionList(w http.ResponseWriter, r *http.Request) {
-	dir := socketDir()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"sessions": []interface{}{}})
-		return
+// discoverSockets finds all acp-multiplex sockets, checking both the new
+// location ($TMPDIR/acp-multiplex/<pid>.sock) and legacy format
+// ($TMPDIR/acp-multiplex-<pid>.sock).
+func discoverSockets() []struct {
+	pid  int
+	path string
+} {
+	var socks []struct {
+		pid  int
+		path string
 	}
+	seen := map[int]bool{}
+
+	// New location: $TMPDIR/acp-multiplex/<pid>.sock
+	dir := socketDir()
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".sock") {
+				continue
+			}
+			pidStr := strings.TrimSuffix(name, ".sock")
+			pid, err := strconv.Atoi(pidStr)
+			if err != nil {
+				continue
+			}
+			if syscall.Kill(pid, 0) != nil {
+				os.Remove(filepath.Join(dir, name))
+				continue
+			}
+			seen[pid] = true
+			socks = append(socks, struct {
+				pid  int
+				path string
+			}{pid, filepath.Join(dir, name)})
+		}
+	}
+
+	// Legacy location: $TMPDIR/acp-multiplex-<pid>.sock
+	tmpdir := os.TempDir()
+	if entries, err := os.ReadDir(tmpdir); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasPrefix(name, "acp-multiplex-") || !strings.HasSuffix(name, ".sock") {
+				continue
+			}
+			pidStr := strings.TrimPrefix(name, "acp-multiplex-")
+			pidStr = strings.TrimSuffix(pidStr, ".sock")
+			pid, err := strconv.Atoi(pidStr)
+			if err != nil {
+				continue
+			}
+			if seen[pid] {
+				continue
+			}
+			if syscall.Kill(pid, 0) != nil {
+				os.Remove(filepath.Join(tmpdir, name))
+				continue
+			}
+			socks = append(socks, struct {
+				pid  int
+				path string
+			}{pid, filepath.Join(tmpdir, name)})
+		}
+	}
+
+	return socks
+}
+
+// handleSessionList scans for live proxies and probes each for session info.
+func handleSessionList(w http.ResponseWriter, r *http.Request) {
+	socks := discoverSockets()
 
 	type result struct {
 		info sessionInfo
@@ -95,32 +161,17 @@ func handleSessionList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var wg sync.WaitGroup
-	results := make([]result, len(entries))
+	results := make([]result, len(socks))
 
-	for i, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, ".sock") {
-			continue
-		}
-		pidStr := strings.TrimSuffix(name, ".sock")
-		pid, err := strconv.Atoi(pidStr)
-		if err != nil {
-			continue
-		}
-		// Check process is alive
-		if err := syscall.Kill(pid, 0); err != nil {
-			os.Remove(filepath.Join(dir, name))
-			continue
-		}
-
+	for i, s := range socks {
 		idx := i
-		sockFile := filepath.Join(dir, name)
+		sock := s
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			info, err := probeSocket(sockFile, pid)
+			info, err := probeSocket(sock.path, sock.pid)
 			if err != nil {
-				log.Printf("probe %s: %v", sockFile, err)
+				log.Printf("probe %s: %v", sock.path, err)
 				return
 			}
 			results[idx] = result{info: info, ok: true}
