@@ -289,6 +289,10 @@ func (p *Proxy) routeReverseCall(env *Envelope, line []byte) {
 	if strings.HasPrefix(env.Method, "fs/") || strings.HasPrefix(env.Method, "terminal/") {
 		p.sendToPrimary(line)
 	} else {
+		// Cache permission requests so late-joining frontends can respond
+		if env.Method == "session/request_permission" {
+			p.cache.SetPendingPermission(line)
+		}
 		p.broadcast(line)
 	}
 }
@@ -336,6 +340,7 @@ func (p *Proxy) readFromFrontends() {
 			if env.ID != nil {
 				idKey := string(*env.ID)
 				if _, loaded := p.pendingReverse.LoadAndDelete(idKey); loaded {
+					p.cache.ClearPendingPermission()
 					if err := p.sendToAgent(msg.Line); err != nil {
 						log.Printf("frontend %d: send response to agent failed: %v", msg.Frontend.id, err)
 					}

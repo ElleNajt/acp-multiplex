@@ -519,6 +519,113 @@ func TestModeChangeReplayedToLateJoiner(t *testing.T) {
 	}
 }
 
+func TestPermissionReplayedToLateJoiner(t *testing.T) {
+	// When the agent sends a permission request and a frontend connects later,
+	// the pending permission should be replayed so the new frontend can respond.
+	agentInR, agentInW := io.Pipe()
+	agentOutR, agentOutW := io.Pipe()
+
+	// Custom mock: responds to initialize, then sends a permission request
+	go func() {
+		scanner := bufio.NewScanner(agentInR)
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+		for scanner.Scan() {
+			env, err := parseEnvelope(scanner.Bytes())
+			if err != nil {
+				continue
+			}
+			if env.Method == "initialize" {
+				resp, _ := json.Marshal(map[string]interface{}{
+					"jsonrpc": "2.0",
+					"id":      json.RawMessage(*env.ID),
+					"result":  map[string]interface{}{"protocolVersion": 1, "agentInfo": map[string]string{"name": "mock"}},
+				})
+				agentOutW.Write(resp)
+				agentOutW.Write([]byte("\n"))
+
+				// Then send a permission request (reverse call)
+				perm, _ := json.Marshal(map[string]interface{}{
+					"jsonrpc": "2.0",
+					"id":      99,
+					"method":  "session/request_permission",
+					"params": map[string]interface{}{
+						"sessionId": "s1",
+						"options": []map[string]string{
+							{"kind": "allow_once", "name": "Yes", "optionId": "yes"},
+							{"kind": "reject_once", "name": "No", "optionId": "no"},
+						},
+						"toolCall": map[string]string{"title": "Ready to code?"},
+					},
+				})
+				agentOutW.Write(perm)
+				agentOutW.Write([]byte("\n"))
+			}
+		}
+	}()
+
+	cache := NewCache()
+	proxy := NewProxy(agentInW, agentOutR, cache)
+
+	// Primary frontend
+	fe1R, fe1W := io.Pipe()
+	pr1R, pr1W := io.Pipe()
+	fe1Scanner := bufio.NewScanner(pr1R)
+	fe1Scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	f1 := &Frontend{
+		id: 1, primary: true,
+		scanner: bufio.NewScanner(fe1R),
+		writer:  pr1W,
+		done:    make(chan struct{}),
+	}
+	f1.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	proxy.AddFrontend(f1)
+	go proxy.Run()
+
+	// Send init request — mock agent responds then sends permission request
+	fe1W.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}` + "\n"))
+
+	// Primary frontend receives init response + permission
+	readLine(t, fe1Scanner, 2*time.Second) // init response
+	permLine := readLine(t, fe1Scanner, 2*time.Second)
+	var perm map[string]interface{}
+	json.Unmarshal(permLine, &perm)
+	if perm["method"] != "session/request_permission" {
+		t.Fatalf("expected session/request_permission, got: %s", permLine)
+	}
+
+	// Now a second frontend connects — it should get the pending permission in replay
+	fe2ReadR, _ := io.Pipe()
+	pr2R, pr2W := io.Pipe()
+	fe2Scanner := bufio.NewScanner(pr2R)
+	fe2Scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	f2 := &Frontend{
+		id: 2, primary: false,
+		scanner: bufio.NewScanner(fe2ReadR),
+		writer:  pr2W,
+		done:    make(chan struct{}),
+	}
+	f2.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	proxy.AddFrontend(f2)
+
+	// Drain replay: init response, then the pending permission
+	readLine(t, fe2Scanner, 2*time.Second) // init response
+
+	permReplay := readLine(t, fe2Scanner, 2*time.Second)
+	var pr map[string]interface{}
+	json.Unmarshal(permReplay, &pr)
+	if pr["method"] != "session/request_permission" {
+		t.Fatalf("expected session/request_permission in replay, got: %s", permReplay)
+	}
+	prParams := pr["params"].(map[string]interface{})
+	tc := prParams["toolCall"].(map[string]interface{})
+	if tc["title"] != "Ready to code?" {
+		t.Errorf("expected title 'Ready to code?', got %v", tc["title"])
+	}
+}
+
 func TestProxyIDRewriting(t *testing.T) {
 	// Two frontends send requests with the same ID — proxy must handle this.
 	agentInR, agentInW := io.Pipe()

@@ -15,6 +15,11 @@ type Cache struct {
 	newResp  []byte   // cached session/new response
 	updates  [][]byte // coalesced session/update notifications
 
+	// Pending permission request from the agent (reverse call).
+	// Stored so late-joining frontends can see and respond to it.
+	// Cleared when a response is sent back.
+	pendingPermission []byte
+
 	// Accumulator for the current run of chunks
 	chunkType string // "agent_message_chunk" or "agent_thought_chunk", or ""
 	chunkText string
@@ -46,6 +51,18 @@ func (c *Cache) SetNewResponse(line []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.newResp = append([]byte(nil), line...)
+}
+
+func (c *Cache) SetPendingPermission(line []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pendingPermission = append([]byte(nil), line...)
+}
+
+func (c *Cache) ClearPendingPermission() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pendingPermission = nil
 }
 
 func (c *Cache) AddUpdate(line []byte) {
@@ -116,6 +133,7 @@ func (c *Cache) Replay(f *Frontend) {
 	meta := c.meta
 	updates := make([][]byte, len(c.updates))
 	copy(updates, c.updates)
+	pendingPerm := c.pendingPermission
 	c.mu.Unlock()
 
 	if meta != nil {
@@ -137,6 +155,9 @@ func (c *Cache) Replay(f *Frontend) {
 		if !f.Send(u) {
 			return
 		}
+	}
+	if pendingPerm != nil {
+		f.Send(pendingPerm)
 	}
 }
 
