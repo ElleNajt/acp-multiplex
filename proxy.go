@@ -18,7 +18,8 @@ import (
 type PendingRequest struct {
 	originalID json.RawMessage
 	frontend   *Frontend
-	method     string // for cache decisions
+	method     string          // for cache decisions
+	params     json.RawMessage // original params (for synthesizing notifications)
 }
 
 // Proxy is the core multiplexer. It reads from the agent and fans out
@@ -259,6 +260,12 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 		p.synthesizeTurnComplete(line, pr.frontend)
 	}
 
+	// For session/set_mode responses, synthesize a current_mode_update
+	// notification so all other frontends (and the primary) learn about the change.
+	if pr.method == "session/set_mode" {
+		p.synthesizeModeChange(pr)
+	}
+
 	// Rewrite ID back to the frontend's original
 	rewritten, err := restoreID(line, pr.originalID)
 	if err != nil {
@@ -356,6 +363,7 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 		originalID: origID,
 		frontend:   f,
 		method:     env.Method,
+		params:     env.Params,
 	})
 
 	// Rewrite ID and forward
@@ -469,6 +477,42 @@ func (p *Proxy) synthesizeTurnComplete(responseLine []byte, sender *Frontend) {
 
 	p.cache.AddUpdate(line)
 	go p.broadcastExcept(line, sender)
+}
+
+// synthesizeModeChange broadcasts a current_mode_update notification to all
+// frontends when a session/set_mode request succeeds. The agent doesn't emit
+// this notification itself, so the proxy must synthesize it from the original
+// request params.
+func (p *Proxy) synthesizeModeChange(pr *PendingRequest) {
+	var params struct {
+		SessionID string `json:"sessionId"`
+		ModeID    string `json:"modeId"`
+	}
+	if err := json.Unmarshal(pr.params, &params); err != nil {
+		log.Printf("synthesize mode change: parse params: %v", err)
+		return
+	}
+
+	notif := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]interface{}{
+			"sessionId": params.SessionID,
+			"update": map[string]interface{}{
+				"sessionUpdate": "current_mode_update",
+				"currentModeId": params.ModeID,
+			},
+		},
+	}
+
+	line, err := json.Marshal(notif)
+	if err != nil {
+		log.Printf("synthesize mode change: marshal: %v", err)
+		return
+	}
+
+	p.cache.AddUpdate(line)
+	p.broadcastExcept(line, pr.frontend)
 }
 
 // restoreID replaces the "id" field with the original raw JSON value.
