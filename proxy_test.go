@@ -337,6 +337,188 @@ func TestModeChangeSynthesis(t *testing.T) {
 	}
 }
 
+func TestBufferNameReplay(t *testing.T) {
+	// When ACP_MULTIPLEX_NAME is set, a secondary frontend should receive
+	// the acp-multiplex/meta notification with the buffer name on connect.
+	agentInR, agentInW := io.Pipe()
+	agentOutR, agentOutW := io.Pipe()
+
+	go mockAgent(agentInR, agentOutW)
+
+	cache := NewCache()
+
+	// Simulate what main.go does with ACP_MULTIPLEX_NAME
+	bufferName := "Claude Code Agent @ myproject"
+	meta, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "acp-multiplex/meta",
+		"params":  map[string]string{"name": bufferName},
+	})
+	cache.SetMeta(meta)
+
+	proxy := NewProxy(agentInW, agentOutR, cache)
+
+	// Primary frontend
+	fe1R, fe1W := io.Pipe()
+	pr1R, pr1W := io.Pipe()
+	fe1Scanner := bufio.NewScanner(pr1R)
+	fe1Scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	f1 := &Frontend{
+		id: 1, primary: true,
+		scanner: bufio.NewScanner(fe1R),
+		writer:  pr1W,
+		done:    make(chan struct{}),
+	}
+	f1.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	proxy.AddFrontend(f1)
+	go proxy.Run()
+
+	// Initialize + session/new via primary
+	fe1W.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}` + "\n"))
+	readLine(t, fe1Scanner, 2*time.Second)
+	fe1W.Write([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}` + "\n"))
+	readLine(t, fe1Scanner, 2*time.Second)
+
+	// Secondary frontend connects (like acp-mobile probing the socket)
+	_, _ = io.Pipe() // fe2R not needed — secondary won't send anything
+	pr2R, pr2W := io.Pipe()
+	fe2Scanner := bufio.NewScanner(pr2R)
+	fe2Scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	fe2ReadR, _ := io.Pipe()
+	f2 := &Frontend{
+		id: 2, primary: false,
+		scanner: bufio.NewScanner(fe2ReadR),
+		writer:  pr2W,
+		done:    make(chan struct{}),
+	}
+	f2.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	proxy.AddFrontend(f2)
+
+	// First replay message should be the meta notification
+	metaLine := readLine(t, fe2Scanner, 2*time.Second)
+	var m map[string]interface{}
+	json.Unmarshal(metaLine, &m)
+	if m["method"] != "acp-multiplex/meta" {
+		t.Fatalf("expected acp-multiplex/meta, got: %s", metaLine)
+	}
+	params := m["params"].(map[string]interface{})
+	if params["name"] != bufferName {
+		t.Errorf("expected buffer name %q, got %v", bufferName, params["name"])
+	}
+
+	// Then init response
+	initLine := readLine(t, fe2Scanner, 2*time.Second)
+	var ir map[string]interface{}
+	json.Unmarshal(initLine, &ir)
+	if ir["result"] == nil {
+		t.Errorf("expected init response, got: %s", initLine)
+	}
+
+	// Then session/new response
+	newLine := readLine(t, fe2Scanner, 2*time.Second)
+	var nr map[string]interface{}
+	json.Unmarshal(newLine, &nr)
+	if nr["result"] == nil {
+		t.Errorf("expected session/new response, got: %s", newLine)
+	}
+}
+
+func TestModeChangeReplayedToLateJoiner(t *testing.T) {
+	// After a mode change, a frontend that connects later should see
+	// the current_mode_update in its replay stream.
+	agentInR, agentInW := io.Pipe()
+	agentOutR, agentOutW := io.Pipe()
+
+	go mockAgent(agentInR, agentOutW)
+
+	cache := NewCache()
+	proxy := NewProxy(agentInW, agentOutR, cache)
+
+	// Primary frontend
+	fe1R, fe1W := io.Pipe()
+	pr1R, pr1W := io.Pipe()
+	fe1Scanner := bufio.NewScanner(pr1R)
+	fe1Scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	f1 := &Frontend{
+		id: 1, primary: true,
+		scanner: bufio.NewScanner(fe1R),
+		writer:  pr1W,
+		done:    make(chan struct{}),
+	}
+	f1.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	// Secondary frontend that triggers the mode change
+	fe2R, fe2W := io.Pipe()
+	pr2R, pr2W := io.Pipe()
+	fe2Scanner := bufio.NewScanner(pr2R)
+	fe2Scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	f2 := &Frontend{
+		id: 2, primary: false,
+		scanner: bufio.NewScanner(fe2R),
+		writer:  pr2W,
+		done:    make(chan struct{}),
+	}
+	f2.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	proxy.AddFrontend(f1)
+	go proxy.Run()
+
+	// Initialize + session/new
+	fe1W.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}` + "\n"))
+	readLine(t, fe1Scanner, 2*time.Second)
+	fe1W.Write([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}` + "\n"))
+	readLine(t, fe1Scanner, 2*time.Second)
+
+	// Add frontend 2, drain replay
+	proxy.AddFrontend(f2)
+	readLine(t, fe2Scanner, 2*time.Second) // init
+	readLine(t, fe2Scanner, 2*time.Second) // session/new
+
+	// Frontend 2 changes mode
+	fe2W.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/set_mode","params":{"sessionId":"test-session-1","modeId":"plan"}}` + "\n"))
+	readLine(t, fe2Scanner, 2*time.Second) // set_mode response
+	readLine(t, fe1Scanner, 2*time.Second) // mode update on primary
+
+	// Now a third frontend connects — it should see the mode change in replay
+	fe3ReadR, _ := io.Pipe()
+	pr3R, pr3W := io.Pipe()
+	fe3Scanner := bufio.NewScanner(pr3R)
+	fe3Scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	f3 := &Frontend{
+		id: 3, primary: false,
+		scanner: bufio.NewScanner(fe3ReadR),
+		writer:  pr3W,
+		done:    make(chan struct{}),
+	}
+	f3.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	proxy.AddFrontend(f3)
+
+	// Drain replay: init, session/new, then the mode update
+	readLine(t, fe3Scanner, 2*time.Second) // init
+	readLine(t, fe3Scanner, 2*time.Second) // session/new
+
+	modeLine := readLine(t, fe3Scanner, 2*time.Second)
+	var mu map[string]interface{}
+	json.Unmarshal(modeLine, &mu)
+	if mu["method"] != "session/update" {
+		t.Fatalf("expected session/update, got: %s", modeLine)
+	}
+	params := mu["params"].(map[string]interface{})
+	update := params["update"].(map[string]interface{})
+	if update["sessionUpdate"] != "current_mode_update" {
+		t.Errorf("expected current_mode_update in replay, got %v", update["sessionUpdate"])
+	}
+	if update["currentModeId"] != "plan" {
+		t.Errorf("expected modeId 'plan' in replay, got %v", update["currentModeId"])
+	}
+}
+
 func TestProxyIDRewriting(t *testing.T) {
 	// Two frontends send requests with the same ID — proxy must handle this.
 	agentInR, agentInW := io.Pipe()
