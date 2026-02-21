@@ -1,6 +1,6 @@
 # acp-multiplex
 
-> **Work in Progress** — This is an experimental project under active development.
+> **Work in Progress** — Functional and in daily use (multiplexing [agent-shell](https://github.com/xenodium/agent-shell) and [acp-mobile](https://github.com/ElleNajt/acp-mobile)), but still encountering edge cases and actively debugging.
 
 Multiplexing proxy for [ACP](https://github.com/agentclientprotocol/agent-client-protocol) agents.
 
