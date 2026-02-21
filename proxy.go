@@ -512,7 +512,7 @@ func (p *Proxy) synthesizeModeChange(pr *PendingRequest) {
 	}
 
 	p.cache.AddUpdate(line)
-	p.broadcastExcept(line, pr.frontend)
+	go p.broadcastExcept(line, pr.frontend)
 }
 
 // restoreID replaces the "id" field with the original raw JSON value.

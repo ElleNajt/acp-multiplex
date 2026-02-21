@@ -54,6 +54,16 @@ func mockAgent(stdin io.Reader, stdout io.Writer) {
 			stdout.Write(b)
 			stdout.Write([]byte("\n"))
 
+		case "session/set_mode":
+			resp := map[string]interface{}{
+				"jsonrpc": "2.0",
+				"id":      json.RawMessage(*env.ID),
+				"result":  map[string]interface{}{},
+			}
+			b, _ := json.Marshal(resp)
+			stdout.Write(b)
+			stdout.Write([]byte("\n"))
+
 		case "session/prompt":
 			// Send a session/update notification
 			update := map[string]interface{}{
@@ -243,6 +253,87 @@ func TestProxyFanOut(t *testing.T) {
 	}
 	if update["stopReason"] != "endTurn" {
 		t.Errorf("expected stopReason endTurn, got %v", update["stopReason"])
+	}
+}
+
+func TestModeChangeSynthesis(t *testing.T) {
+	agentInR, agentInW := io.Pipe()
+	agentOutR, agentOutW := io.Pipe()
+
+	go mockAgent(agentInR, agentOutW)
+
+	cache := NewCache()
+	proxy := NewProxy(agentInW, agentOutR, cache)
+
+	// Frontend 1 (primary)
+	fe1R, fe1W := io.Pipe()
+	pr1R, pr1W := io.Pipe()
+	fe1Scanner := bufio.NewScanner(pr1R)
+	fe1Scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	f1 := &Frontend{
+		id: 1, primary: true,
+		scanner: bufio.NewScanner(fe1R),
+		writer:  pr1W,
+		done:    make(chan struct{}),
+	}
+	f1.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	// Frontend 2 (secondary, simulating acp-mobile)
+	fe2R, fe2W := io.Pipe()
+	pr2R, pr2W := io.Pipe()
+	fe2Scanner := bufio.NewScanner(pr2R)
+	fe2Scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	f2 := &Frontend{
+		id: 2, primary: false,
+		scanner: bufio.NewScanner(fe2R),
+		writer:  pr2W,
+		done:    make(chan struct{}),
+	}
+	f2.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	proxy.AddFrontend(f1)
+	go proxy.Run()
+
+	// Initialize via frontend 1
+	fe1W.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}` + "\n"))
+	readLine(t, fe1Scanner, 2*time.Second) // init response
+
+	// session/new via frontend 1
+	fe1W.Write([]byte(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}` + "\n"))
+	readLine(t, fe1Scanner, 2*time.Second) // new response
+
+	// Now add frontend 2 — it gets replayed init + session/new
+	proxy.AddFrontend(f2)
+	readLine(t, fe2Scanner, 2*time.Second) // replayed init
+	readLine(t, fe2Scanner, 2*time.Second) // replayed session/new
+
+	// Frontend 2 sends session/set_mode (like acp-mobile changing mode)
+	fe2W.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"session/set_mode","params":{"sessionId":"test-session-1","modeId":"plan"}}` + "\n"))
+
+	// Frontend 2 should get the response back
+	resp2 := readLine(t, fe2Scanner, 2*time.Second)
+	var r2 map[string]interface{}
+	json.Unmarshal(resp2, &r2)
+	if r2["result"] == nil {
+		t.Fatalf("frontend 2: expected result in set_mode response, got: %s", resp2)
+	}
+
+	// Frontend 1 (primary) should get a synthetic current_mode_update notification
+	modeUpdate := readLine(t, fe1Scanner, 2*time.Second)
+	var mu map[string]interface{}
+	json.Unmarshal(modeUpdate, &mu)
+	if mu["method"] != "session/update" {
+		t.Fatalf("frontend 1: expected session/update, got: %s", modeUpdate)
+	}
+	params := mu["params"].(map[string]interface{})
+	update := params["update"].(map[string]interface{})
+	if update["sessionUpdate"] != "current_mode_update" {
+		t.Errorf("expected current_mode_update, got %v", update["sessionUpdate"])
+	}
+	if update["currentModeId"] != "plan" {
+		t.Errorf("expected modeId 'plan', got %v", update["currentModeId"])
 	}
 }
 
