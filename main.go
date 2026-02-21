@@ -15,6 +15,8 @@ import (
 	"syscall"
 )
 
+var Debug bool
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "usage:\n")
@@ -33,6 +35,19 @@ func main() {
 
 // runProxy starts the agent subprocess and multiplexing proxy.
 func runProxy() {
+	// Set up debug logging to file
+	Debug = false
+	logDir := filepath.Join(socketDir(), "logs")
+	os.MkdirAll(logDir, 0700)
+	logPath := filepath.Join(logDir, fmt.Sprintf("%d.log", os.Getpid()))
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create log file: %v\n", err)
+	} else {
+		log.SetOutput(logFile)
+		log.SetFlags(log.Ltime | log.Lmicroseconds)
+	}
+
 	cleanStaleSockets()
 
 	agentArgs := os.Args[1:]
@@ -78,7 +93,7 @@ func runProxy() {
 		log.Fatalf("listen unix: %v", err)
 	}
 	defer os.Remove(sockPath)
-	fmt.Fprintf(os.Stderr, "acp-multiplex: socket %s\n", sockPath)
+	fmt.Fprintf(os.Stderr, "acp-multiplex: socket %s, log %s/logs/%d.log\n", sockPath, socketDir(), os.Getpid())
 
 	nextID := 1
 	go func() {
@@ -104,7 +119,19 @@ func runProxy() {
 	}()
 
 	go proxy.Run()
-	cmd.Wait()
+	err = cmd.Wait()
+	if err != nil {
+		log.Printf("agent process exited: %v", err)
+	} else {
+		log.Printf("agent process exited: status 0")
+	}
+	if cmd.ProcessState != nil {
+		log.Printf("agent exit details: pid=%d, exitcode=%d, sys=%v",
+			cmd.ProcessState.Pid(), cmd.ProcessState.ExitCode(), cmd.ProcessState.Sys())
+	}
+	ln.Close()
+	os.Remove(sockPath)
+	os.Exit(0)
 }
 
 // runAttach bridges stdin/stdout to an existing proxy's Unix socket.

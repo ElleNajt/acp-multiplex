@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -31,6 +32,7 @@ type Proxy struct {
 	nextID         atomic.Int64
 	pending        sync.Map // proxyID (int64) -> *PendingRequest
 	pendingReverse sync.Map // agent request ID (string) -> struct{}
+	agentDead      atomic.Bool
 
 	cache *Cache
 
@@ -102,12 +104,21 @@ func (p *Proxy) RemoveFrontend(f *Frontend) {
 }
 
 // sendToAgent writes a JSON line to the agent's stdin.
-func (p *Proxy) sendToAgent(line []byte) {
+// Returns an error if the agent is dead or the write fails.
+func (p *Proxy) sendToAgent(line []byte) error {
+	if p.agentDead.Load() {
+		return errAgentDead
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.agentIn.Write(line)
-	p.agentIn.Write([]byte("\n"))
+	if _, err := p.agentIn.Write(line); err != nil {
+		return err
+	}
+	_, err := p.agentIn.Write([]byte("\n"))
+	return err
 }
+
+var errAgentDead = fmt.Errorf("agent process exited")
 
 // broadcast sends a JSON line to all connected frontends.
 func (p *Proxy) broadcast(line []byte) {
@@ -120,6 +131,14 @@ func (p *Proxy) broadcastExcept(line []byte, except *Frontend) {
 	fes := make([]*Frontend, len(p.frontends))
 	copy(fes, p.frontends)
 	p.mu.Unlock()
+
+	if Debug {
+		exceptID := -1
+		if except != nil {
+			exceptID = except.id
+		}
+		log.Printf("broadcast to %d frontends (except %d): %.100s", len(fes), exceptID, string(line))
+	}
 
 	for _, f := range fes {
 		if f != except {
@@ -173,6 +192,28 @@ func (p *Proxy) readFromAgent() {
 	if err := p.agentOut.Err(); err != nil {
 		log.Printf("agent stdout error: %v", err)
 	}
+
+	// Agent exited — mark dead and drain all pending requests with errors.
+	p.agentDead.Store(true)
+	log.Printf("agent exited, draining pending requests")
+	p.pending.Range(func(key, value interface{}) bool {
+		proxyID := key.(int64)
+		pr := value.(*PendingRequest)
+		p.pending.Delete(proxyID)
+
+		errResp, _ := json.Marshal(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      pr.originalID,
+			"error": map[string]interface{}{
+				"code":    -32603,
+				"message": "Agent process exited",
+			},
+		})
+		log.Printf("sending error response for pending request %d (method %s) to frontend %d",
+			proxyID, pr.method, pr.frontend.id)
+		pr.frontend.Send(errResp)
+		return true
+	})
 }
 
 // routeResponseToFrontend routes an agent response back to the
@@ -223,6 +264,9 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 		log.Printf("failed to restore id: %v", err)
 		return
 	}
+	if Debug {
+		log.Printf("send to frontend %d: %.100s", pr.frontend.id, string(rewritten))
+	}
 	pr.frontend.Send(rewritten)
 }
 
@@ -269,14 +313,18 @@ func (p *Proxy) readFromFrontends() {
 
 		case KindNotification:
 			// session/cancel etc — forward directly
-			p.sendToAgent(msg.Line)
+			if err := p.sendToAgent(msg.Line); err != nil {
+				log.Printf("frontend %d: send notification to agent failed: %v", msg.Frontend.id, err)
+			}
 
 		case KindResponse:
 			// Response to a reverse call — first response wins, drop duplicates.
 			if env.ID != nil {
 				idKey := string(*env.ID)
 				if _, loaded := p.pendingReverse.LoadAndDelete(idKey); loaded {
-					p.sendToAgent(msg.Line)
+					if err := p.sendToAgent(msg.Line); err != nil {
+						log.Printf("frontend %d: send response to agent failed: %v", msg.Frontend.id, err)
+					}
 				}
 				// else: duplicate response from another frontend, drop it
 			}
@@ -317,7 +365,20 @@ func (p *Proxy) handleFrontendRequest(f *Frontend, env *Envelope, line []byte) {
 		p.synthesizeUserMessage(env, f)
 	}
 
-	p.sendToAgent(rewritten)
+	if err := p.sendToAgent(rewritten); err != nil {
+		log.Printf("frontend %d: send to agent failed: %v", f.id, err)
+		p.pending.Delete(proxyID)
+		errResp, _ := json.Marshal(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      origID,
+			"error": map[string]interface{}{
+				"code":    -32603,
+				"message": "Agent process exited",
+			},
+		})
+		f.Send(errResp)
+		return
+	}
 }
 
 // synthesizeUserMessage extracts prompt content blocks from a session/prompt

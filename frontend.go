@@ -23,9 +23,20 @@ type Frontend struct {
 func (f *Frontend) Send(line []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	// Append newline
-	f.writer.Write(line)
-	f.writer.Write([]byte("\n"))
+
+	// Combine line and newline into single write to prevent splitting
+	msg := make([]byte, len(line)+1)
+	copy(msg, line)
+	msg[len(line)] = '\n'
+
+	n, err := f.writer.Write(msg)
+	if err != nil {
+		log.Printf("frontend %d write error: %v", f.id, err)
+		return
+	}
+	if n != len(msg) {
+		log.Printf("frontend %d short write: wrote %d/%d bytes", f.id, n, len(msg))
+	}
 }
 
 // NewStdioFrontend creates a frontend connected to stdin/stdout.
