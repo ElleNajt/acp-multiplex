@@ -119,16 +119,24 @@ func (c *Cache) Replay(f *Frontend) {
 	c.mu.Unlock()
 
 	if meta != nil {
-		f.Send(meta)
+		if !f.Send(meta) {
+			return
+		}
 	}
 	if initResp != nil {
-		f.Send(initResp)
+		if !f.Send(initResp) {
+			return
+		}
 	}
 	if newResp != nil {
-		f.Send(newResp)
+		if !f.Send(newResp) {
+			return
+		}
 	}
 	for _, u := range updates {
-		f.Send(u)
+		if !f.Send(u) {
+			return
+		}
 	}
 }
 

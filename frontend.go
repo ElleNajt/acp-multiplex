@@ -16,13 +16,19 @@ type Frontend struct {
 	scanner *bufio.Scanner
 	writer  io.Writer
 	mu      sync.Mutex // protects writer
+	dead    bool       // set on first write error; skip further writes
 	done    chan struct{}
 }
 
 // Send writes a JSON line to this frontend. Thread-safe.
-func (f *Frontend) Send(line []byte) {
+// Returns false if the frontend is dead (write error occurred).
+func (f *Frontend) Send(line []byte) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if f.dead {
+		return false
+	}
 
 	// Combine line and newline into single write to prevent splitting
 	msg := make([]byte, len(line)+1)
@@ -32,11 +38,13 @@ func (f *Frontend) Send(line []byte) {
 	n, err := f.writer.Write(msg)
 	if err != nil {
 		log.Printf("frontend %d write error: %v", f.id, err)
-		return
+		f.dead = true
+		return false
 	}
 	if n != len(msg) {
 		log.Printf("frontend %d short write: wrote %d/%d bytes", f.id, n, len(msg))
 	}
+	return true
 }
 
 // NewStdioFrontend creates a frontend connected to stdin/stdout.
