@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -182,7 +183,7 @@ func (p *Proxy) readFromAgent() {
 
 		case KindRequest:
 			// Reverse call from agent (fs/*, terminal/*, session/requestPermission).
-			// Broadcast to all frontends; first response wins.
+			// fs/terminal go to primary; permissions broadcast to all.
 			p.routeReverseCall(env, line)
 
 		default:
@@ -270,13 +271,19 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 	pr.frontend.Send(rewritten)
 }
 
-// routeReverseCall broadcasts an agent-initiated request to all frontends.
-// The first frontend to respond wins; subsequent responses are dropped.
+// routeReverseCall routes an agent-initiated request to the appropriate frontend(s).
+// fs/* and terminal/* go to primary only (they need real filesystem/terminal access).
+// Everything else (e.g. session/requestPermission) is broadcast to all frontends;
+// the first response wins and subsequent responses are dropped.
 func (p *Proxy) routeReverseCall(env *Envelope, line []byte) {
 	if env.ID != nil {
 		p.pendingReverse.Store(string(*env.ID), struct{}{})
 	}
-	p.broadcast(line)
+	if strings.HasPrefix(env.Method, "fs/") || strings.HasPrefix(env.Method, "terminal/") {
+		p.sendToPrimary(line)
+	} else {
+		p.broadcast(line)
+	}
 }
 
 func (p *Proxy) sendToPrimary(line []byte) {
