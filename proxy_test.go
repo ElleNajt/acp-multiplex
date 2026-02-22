@@ -777,3 +777,107 @@ func TestUnixSocket(t *testing.T) {
 		t.Errorf("expected 'hello', got %q", scanner.Text())
 	}
 }
+
+// TestPermissionReplayAfterTurnComplete verifies that when a previous turn
+// completed (turn_complete cached) and then a new turn sends a permission
+// request, the late joiner receives the permission as the very last message
+// in replay — after the turn_complete. This is the plan mode scenario:
+// previous conversation turn completes, then agent enters plan mode and
+// sends ExitPlanMode which triggers a permission request.
+func TestPermissionReplayAfterTurnComplete(t *testing.T) {
+	cache := NewCache()
+
+	// Simulate a completed previous turn
+	cache.SetInitResponse([]byte(`{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentInfo":{"name":"mock"}}}`))
+	cache.SetNewResponse([]byte(`{"jsonrpc":"2.0","id":0,"result":{"sessionId":"s1"}}`))
+
+	// User message
+	cache.AddUpdate([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"help me plan"}}}}`))
+	// Agent response
+	cache.AddUpdate([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Sure, entering plan mode."}}}}`))
+	// Turn complete from previous turn
+	cache.AddUpdate([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"turn_complete"}}}`))
+	// New turn: agent writes plan
+	cache.AddUpdate([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Here is my plan."}}}}`))
+	cache.AddUpdate([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"tc1","toolName":"Write"}}}`))
+	cache.AddUpdate([]byte(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc1","status":"completed"}}}`))
+
+	// Pending permission (ExitPlanMode)
+	cache.SetPendingPermission([]byte(`{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s1","options":[{"kind":"allow_once","name":"Yes","optionId":"yes"},{"kind":"reject_once","name":"No","optionId":"no"}],"toolCall":{"title":"Ready to code?"}}}`))
+
+	// Replay to a late joiner
+	r, w := io.Pipe()
+	fe := &Frontend{
+		id:      99,
+		primary: false,
+		scanner: bufio.NewScanner(r), // unused for replay
+		writer:  w,
+		done:    make(chan struct{}),
+	}
+
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	go cache.Replay(fe)
+
+	// Collect all replayed messages
+	var msgs []map[string]interface{}
+	for scanner.Scan() {
+		var msg map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+			t.Fatalf("bad json in replay: %v", err)
+		}
+		msgs = append(msgs, msg)
+
+		// Permission is the last thing sent; after it the pipe stays open
+		// so we need to stop reading. Check if this is the permission.
+		if method, _ := msg["method"].(string); method == "session/request_permission" {
+			break
+		}
+	}
+
+	if len(msgs) == 0 {
+		t.Fatal("no messages received in replay")
+	}
+
+	// The last message must be the permission request
+	last := msgs[len(msgs)-1]
+	if method, _ := last["method"].(string); method != "session/request_permission" {
+		t.Fatalf("expected last replay message to be session/request_permission, got method=%v", last["method"])
+	}
+
+	// Verify permission has the right content
+	params, _ := last["params"].(map[string]interface{})
+	tc, _ := params["toolCall"].(map[string]interface{})
+	if tc["title"] != "Ready to code?" {
+		t.Errorf("expected title 'Ready to code?', got %v", tc["title"])
+	}
+
+	// Verify turn_complete appears before the permission
+	foundTurnComplete := false
+	foundPermission := false
+	for _, msg := range msgs {
+		method, _ := msg["method"].(string)
+		if method == "session/update" {
+			params, _ := msg["params"].(map[string]interface{})
+			update, _ := params["update"].(map[string]interface{})
+			if su, _ := update["sessionUpdate"].(string); su == "turn_complete" {
+				foundTurnComplete = true
+			}
+		}
+		if method == "session/request_permission" {
+			foundPermission = true
+			if !foundTurnComplete {
+				t.Error("permission appeared before turn_complete in replay")
+			}
+		}
+	}
+	if !foundTurnComplete {
+		t.Error("turn_complete not found in replay")
+	}
+	if !foundPermission {
+		t.Error("permission not found in replay")
+	}
+
+	w.Close()
+}
