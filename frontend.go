@@ -50,7 +50,7 @@ func (f *Frontend) Send(line []byte) bool {
 // NewStdioFrontend creates a frontend connected to stdin/stdout.
 func NewStdioFrontend(id int) *Frontend {
 	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB line buffer
+	scanner.Buffer(make([]byte, 1024*1024), 200*1024*1024)
 	return &Frontend{
 		id:      id,
 		primary: true,
@@ -63,7 +63,7 @@ func NewStdioFrontend(id int) *Frontend {
 // NewSocketFrontend creates a frontend from a Unix socket connection.
 func NewSocketFrontend(id int, conn net.Conn) *Frontend {
 	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 1024*1024), 200*1024*1024)
 	return &Frontend{
 		id:      id,
 		primary: false,

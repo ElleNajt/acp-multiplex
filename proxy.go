@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,8 +26,8 @@ type PendingRequest struct {
 // Proxy is the core multiplexer. It reads from the agent and fans out
 // to frontends, and reads from frontends and forwards to the agent.
 type Proxy struct {
-	agentIn  io.Writer      // agent's stdin
-	agentOut *bufio.Scanner // agent's stdout
+	agentIn  io.Writer     // agent's stdin
+	agentOut *bufio.Reader // agent's stdout
 
 	mu        sync.Mutex
 	frontends []*Frontend
@@ -47,11 +48,9 @@ type Proxy struct {
 }
 
 func NewProxy(agentIn io.Writer, agentOut io.Reader, cache *Cache) *Proxy {
-	scanner := bufio.NewScanner(agentOut)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	p := &Proxy{
 		agentIn:       agentIn,
-		agentOut:      scanner,
+		agentOut:      bufio.NewReaderSize(agentOut, 1024*1024),
 		cache:         cache,
 		fromFrontends: make(chan FrontendMessage, 64),
 	}
@@ -156,43 +155,60 @@ func (p *Proxy) Run() {
 }
 
 // readFromAgent reads ndjson from the agent and routes each message.
+// Uses ReadBytes instead of Scanner to handle arbitrarily large lines
+// without a hard size limit that would kill the connection.
 func (p *Proxy) readFromAgent() {
-	for p.agentOut.Scan() {
-		line := make([]byte, len(p.agentOut.Bytes()))
-		copy(line, p.agentOut.Bytes())
-
-		env, err := parseEnvelope(line)
-		if err != nil {
-			log.Printf("agent: bad json: %v", err)
-			continue
-		}
-
-		p.touchSocket()
-
-		kind := classify(env)
-		switch kind {
-		case KindNotification:
-			// session/update — fan out to all frontends and cache
-			if env.Method == "session/update" {
-				p.cache.AddUpdate(line)
+	for {
+		line, err := p.agentOut.ReadBytes('\n')
+		if len(line) > 0 {
+			// Trim the trailing newline
+			line = bytes.TrimRight(line, "\n")
+			if len(line) == 0 {
+				if err != nil {
+					break
+				}
+				continue
 			}
-			p.broadcast(line)
 
-		case KindResponse:
-			// Response to a request we forwarded. Look up who sent it.
-			p.routeResponseToFrontend(env, line)
+			env, perr := parseEnvelope(line)
+			if perr != nil {
+				log.Printf("agent: bad json (%d bytes): %v", len(line), perr)
+				if err != nil {
+					break
+				}
+				continue
+			}
 
-		case KindRequest:
-			// Reverse call from agent (fs/*, terminal/*, session/requestPermission).
-			// fs/terminal go to primary; permissions broadcast to all.
-			p.routeReverseCall(env, line)
+			p.touchSocket()
 
-		default:
-			log.Printf("agent: unclassifiable message")
+			kind := classify(env)
+			switch kind {
+			case KindNotification:
+				// session/update — fan out to all frontends and cache
+				if env.Method == "session/update" {
+					p.cache.AddUpdate(line)
+				}
+				p.broadcast(line)
+
+			case KindResponse:
+				// Response to a request we forwarded. Look up who sent it.
+				p.routeResponseToFrontend(env, line)
+
+			case KindRequest:
+				// Reverse call from agent (fs/*, terminal/*, session/requestPermission).
+				// fs/terminal go to primary; permissions broadcast to all.
+				p.routeReverseCall(env, line)
+
+			default:
+				log.Printf("agent: unclassifiable message")
+			}
 		}
-	}
-	if err := p.agentOut.Err(); err != nil {
-		log.Printf("agent stdout error: %v", err)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("agent stdout read error: %v", err)
+			}
+			break
+		}
 	}
 
 	// Agent exited — mark dead and drain all pending requests with errors.
