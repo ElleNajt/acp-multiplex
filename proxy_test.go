@@ -88,7 +88,7 @@ func mockAgent(stdin io.Reader, stdout io.Writer) {
 			resp := map[string]interface{}{
 				"jsonrpc": "2.0",
 				"id":      json.RawMessage(*env.ID),
-				"result":  map[string]string{"stopReason": "endTurn"},
+				"result":  map[string]string{"stopReason": "end_turn"},
 			}
 			b, _ = json.Marshal(resp)
 			stdout.Write(b)
@@ -251,8 +251,8 @@ func TestProxyFanOut(t *testing.T) {
 	if update["sessionUpdate"] != "turn_complete" {
 		t.Errorf("expected turn_complete, got %v", update["sessionUpdate"])
 	}
-	if update["stopReason"] != "endTurn" {
-		t.Errorf("expected stopReason endTurn, got %v", update["stopReason"])
+	if update["stopReason"] != "end_turn" {
+		t.Errorf("expected stopReason end_turn, got %v", update["stopReason"])
 	}
 }
 
