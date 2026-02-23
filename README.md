@@ -2,7 +2,7 @@
 
 > **Work in Progress** — Functional and in daily use (multiplexing [agent-shell](https://github.com/xenodium/agent-shell) and [acp-mobile](https://github.com/ElleNajt/acp-mobile)), but still encountering edge cases and actively debugging.
 
-Multiplexing proxy for [ACP](https://github.com/agentclientprotocol/agent-client-protocol) agents.
+Multiplexing proxy for [ACP](https://github.com/agentclientprotocol/agent-client-protocol) agents. Unofficial/hacky implementation of the idea described in [RFD: Multi-Client Session Attach](https://github.com/agentclientprotocol/agent-client-protocol/pull/533).
 
 ACP is the protocol between a frontend and an AI agent, using JSON-RPC over stdin/stdout. It's 1:1 — one frontend, one agent. acp-multiplex makes it 1:N, so multiple frontends can share a single agent session.
 
