@@ -62,7 +62,13 @@ func (c *Cache) SetPendingPermission(line []byte) {
 func (c *Cache) ClearPendingPermission() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.pendingPermission = nil
+	// Move answered permission into updates so it replays as history
+	// (e.g. plan approval cards remain visible in replay).
+	if c.pendingPermission != nil {
+		c.flushChunks()
+		c.updates = append(c.updates, c.pendingPermission)
+		c.pendingPermission = nil
+	}
 }
 
 func (c *Cache) AddUpdate(line []byte) {
