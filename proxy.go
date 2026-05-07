@@ -306,10 +306,12 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 // routeReverseCall routes an agent-initiated request to the appropriate frontend(s).
 // fs/* and terminal/* go to primary only (they need real filesystem/terminal access).
 // Everything else (e.g. session/requestPermission) is broadcast to all frontends;
-// the first response wins and subsequent responses are dropped.
+// the first response wins and subsequent responses are dropped. We track the method
+// alongside the id so the response handler can synthesize a follow-up notification
+// for permission resolutions (lets non-responding frontends tear down their stale UI).
 func (p *Proxy) routeReverseCall(env *Envelope, line []byte) {
 	if env.ID != nil {
-		p.pendingReverse.Store(string(*env.ID), struct{}{})
+		p.pendingReverse.Store(string(*env.ID), env.Method)
 	}
 	if strings.HasPrefix(env.Method, "fs/") || strings.HasPrefix(env.Method, "terminal/") {
 		p.sendToPrimary(line)
@@ -364,10 +366,17 @@ func (p *Proxy) readFromFrontends() {
 			// Response to a reverse call — first response wins, drop duplicates.
 			if env.ID != nil {
 				idKey := string(*env.ID)
-				if _, loaded := p.pendingReverse.LoadAndDelete(idKey); loaded {
+				if v, loaded := p.pendingReverse.LoadAndDelete(idKey); loaded {
 					p.cache.ClearPendingPermission()
 					if err := p.sendToAgent(msg.Line); err != nil {
 						log.Printf("frontend %d: send response to agent failed: %v", msg.Frontend.id, err)
+					}
+					// For permission resolutions, tell the other frontends so
+					// they can tear down their stale prompt UI. fs/terminal
+					// resolutions never need this — only the primary ever
+					// sees those — so we gate on method.
+					if method, ok := v.(string); ok && method == "session/request_permission" {
+						p.synthesizePermissionResolved(idKey, msg.Frontend)
 					}
 				}
 				// else: duplicate response from another frontend, drop it
@@ -517,6 +526,29 @@ func (p *Proxy) synthesizeTurnComplete(responseLine []byte, pr *PendingRequest) 
 
 	p.cache.AddUpdate(line)
 	go p.broadcastExcept(line, pr.frontend)
+}
+
+// synthesizePermissionResolved broadcasts a transient notification to every
+// frontend except the responder when a session/request_permission has been
+// resolved. Lets sibling frontends drop their stale "permission requested"
+// UI without the user having to click anything. Not added to the cache —
+// the resolution is meaningful only in real time, and a late-joining frontend
+// shouldn't be told about a permission whose request was already cleared from
+// the cache.
+func (p *Proxy) synthesizePermissionResolved(requestID string, responder *Frontend) {
+	notif := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "acp-multiplex/permission_resolved",
+		"params": map[string]interface{}{
+			"requestId": requestID,
+		},
+	}
+	line, err := json.Marshal(notif)
+	if err != nil {
+		log.Printf("synthesize permission resolved: marshal: %v", err)
+		return
+	}
+	go p.broadcastExcept(line, responder)
 }
 
 // synthesizeModelChange broadcasts a current_model_update notification to all
