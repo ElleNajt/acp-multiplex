@@ -273,7 +273,7 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 	// For session/prompt responses, synthesize a turn-complete notification
 	// so other frontends know the agent finished (they don't get the response).
 	if pr.method == "session/prompt" {
-		p.synthesizeTurnComplete(line, pr.frontend)
+		p.synthesizeTurnComplete(line, pr)
 	}
 
 	// For session/set_mode responses, synthesize a current_mode_update
@@ -459,30 +459,40 @@ func (p *Proxy) synthesizeUserMessage(env *Envelope, sender *Frontend) {
 // and broadcasts a synthetic session/update notification to all frontends except
 // the one that sent the prompt. This lets other frontends know the turn is over
 // (they only see streaming notifications, not the response).
-func (p *Proxy) synthesizeTurnComplete(responseLine []byte, sender *Frontend) {
+func (p *Proxy) synthesizeTurnComplete(responseLine []byte, pr *PendingRequest) {
+	// Extract sessionId from the original request's params — it's reliably
+	// there (session/prompt requires it). Some agents omit it from the
+	// response, so don't depend on it being in responseLine.
+	var reqParams struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.Unmarshal(pr.params, &reqParams); err != nil {
+		log.Printf("synthesize turn complete: parse request params: %v", err)
+		return
+	}
+	if reqParams.SessionID == "" {
+		return
+	}
+
+	// stopReason is best-effort. If the agent returned one, include it;
+	// otherwise emit an empty string. The signal that matters to siblings
+	// is "the turn ended," not its terminal reason — gating on stopReason
+	// being non-empty drops the notification entirely for agents that
+	// don't populate it (e.g. some Claude Code variants), leaving siblings
+	// stuck thinking a turn is still in flight.
 	var resp struct {
 		Result struct {
 			StopReason string `json:"stopReason"`
-			SessionID  string `json:"sessionId"`
 		} `json:"result"`
 	}
-	if err := json.Unmarshal(responseLine, &resp); err != nil {
-		return
-	}
-
+	_ = json.Unmarshal(responseLine, &resp)
 	stopReason := resp.Result.StopReason
-	if stopReason == "" {
-		return
-	}
-
-	// Try to get sessionId from the response; fall back to empty
-	sessionID := resp.Result.SessionID
 
 	notif := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"method":  "session/update",
 		"params": map[string]interface{}{
-			"sessionId": sessionID,
+			"sessionId": reqParams.SessionID,
 			"update": map[string]interface{}{
 				"sessionUpdate": "turn_complete",
 				"stopReason":    stopReason,
@@ -497,7 +507,7 @@ func (p *Proxy) synthesizeTurnComplete(responseLine []byte, sender *Frontend) {
 	}
 
 	p.cache.AddUpdate(line)
-	go p.broadcastExcept(line, sender)
+	go p.broadcastExcept(line, pr.frontend)
 }
 
 // synthesizeModeChange broadcasts a current_mode_update notification to all
