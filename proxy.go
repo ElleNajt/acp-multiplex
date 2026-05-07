@@ -282,6 +282,15 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 		p.synthesizeModeChange(pr)
 	}
 
+	// For session/set_model responses, synthesize a current_model_update
+	// notification so all other frontends learn which model is now active.
+	// Mirrors synthesizeModeChange for the claude-code-acp set_model
+	// extension; without this, sibling frontends miss model changes
+	// initiated by another frontend.
+	if pr.method == "session/set_model" {
+		p.synthesizeModelChange(pr)
+	}
+
 	// Rewrite ID back to the frontend's original
 	rewritten, err := restoreID(line, pr.originalID)
 	if err != nil {
@@ -503,6 +512,42 @@ func (p *Proxy) synthesizeTurnComplete(responseLine []byte, pr *PendingRequest) 
 	line, err := json.Marshal(notif)
 	if err != nil {
 		log.Printf("synthesize turn complete: marshal: %v", err)
+		return
+	}
+
+	p.cache.AddUpdate(line)
+	go p.broadcastExcept(line, pr.frontend)
+}
+
+// synthesizeModelChange broadcasts a current_model_update notification to all
+// frontends when a session/set_model request succeeds. The agent doesn't emit
+// this notification itself, so the proxy must synthesize it from the original
+// request params. Mirrors synthesizeModeChange.
+func (p *Proxy) synthesizeModelChange(pr *PendingRequest) {
+	var params struct {
+		SessionID string `json:"sessionId"`
+		ModelID   string `json:"modelId"`
+	}
+	if err := json.Unmarshal(pr.params, &params); err != nil {
+		log.Printf("synthesize model change: parse params: %v", err)
+		return
+	}
+
+	notif := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]interface{}{
+			"sessionId": params.SessionID,
+			"update": map[string]interface{}{
+				"sessionUpdate":  "current_model_update",
+				"currentModelId": params.ModelID,
+			},
+		},
+	}
+
+	line, err := json.Marshal(notif)
+	if err != nil {
+		log.Printf("synthesize model change: marshal: %v", err)
 		return
 	}
 
