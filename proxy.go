@@ -273,13 +273,22 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 	// For session/prompt responses, synthesize a turn-complete notification
 	// so other frontends know the agent finished (they don't get the response).
 	if pr.method == "session/prompt" {
-		p.synthesizeTurnComplete(line, pr.frontend)
+		p.synthesizeTurnComplete(line, pr)
 	}
 
 	// For session/set_mode responses, synthesize a current_mode_update
 	// notification so all other frontends (and the primary) learn about the change.
 	if pr.method == "session/set_mode" {
 		p.synthesizeModeChange(pr)
+	}
+
+	// For session/set_model responses, synthesize a current_model_update
+	// notification so all other frontends learn which model is now active.
+	// Mirrors synthesizeModeChange for the claude-code-acp set_model
+	// extension; without this, sibling frontends miss model changes
+	// initiated by another frontend.
+	if pr.method == "session/set_model" {
+		p.synthesizeModelChange(pr)
 	}
 
 	// Rewrite ID back to the frontend's original
@@ -297,10 +306,12 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 // routeReverseCall routes an agent-initiated request to the appropriate frontend(s).
 // fs/* and terminal/* go to primary only (they need real filesystem/terminal access).
 // Everything else (e.g. session/requestPermission) is broadcast to all frontends;
-// the first response wins and subsequent responses are dropped.
+// the first response wins and subsequent responses are dropped. We track the method
+// alongside the id so the response handler can synthesize a follow-up notification
+// for permission resolutions (lets non-responding frontends tear down their stale UI).
 func (p *Proxy) routeReverseCall(env *Envelope, line []byte) {
 	if env.ID != nil {
-		p.pendingReverse.Store(string(*env.ID), struct{}{})
+		p.pendingReverse.Store(string(*env.ID), env.Method)
 	}
 	if strings.HasPrefix(env.Method, "fs/") || strings.HasPrefix(env.Method, "terminal/") {
 		p.sendToPrimary(line)
@@ -355,10 +366,17 @@ func (p *Proxy) readFromFrontends() {
 			// Response to a reverse call — first response wins, drop duplicates.
 			if env.ID != nil {
 				idKey := string(*env.ID)
-				if _, loaded := p.pendingReverse.LoadAndDelete(idKey); loaded {
+				if v, loaded := p.pendingReverse.LoadAndDelete(idKey); loaded {
 					p.cache.ClearPendingPermission()
 					if err := p.sendToAgent(msg.Line); err != nil {
 						log.Printf("frontend %d: send response to agent failed: %v", msg.Frontend.id, err)
+					}
+					// For permission resolutions, tell the other frontends so
+					// they can tear down their stale prompt UI. fs/terminal
+					// resolutions never need this — only the primary ever
+					// sees those — so we gate on method.
+					if method, ok := v.(string); ok && method == "session/request_permission" {
+						p.synthesizePermissionResolved(idKey, msg.Frontend)
 					}
 				}
 				// else: duplicate response from another frontend, drop it
@@ -459,30 +477,40 @@ func (p *Proxy) synthesizeUserMessage(env *Envelope, sender *Frontend) {
 // and broadcasts a synthetic session/update notification to all frontends except
 // the one that sent the prompt. This lets other frontends know the turn is over
 // (they only see streaming notifications, not the response).
-func (p *Proxy) synthesizeTurnComplete(responseLine []byte, sender *Frontend) {
+func (p *Proxy) synthesizeTurnComplete(responseLine []byte, pr *PendingRequest) {
+	// Extract sessionId from the original request's params — it's reliably
+	// there (session/prompt requires it). Some agents omit it from the
+	// response, so don't depend on it being in responseLine.
+	var reqParams struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.Unmarshal(pr.params, &reqParams); err != nil {
+		log.Printf("synthesize turn complete: parse request params: %v", err)
+		return
+	}
+	if reqParams.SessionID == "" {
+		return
+	}
+
+	// stopReason is best-effort. If the agent returned one, include it;
+	// otherwise emit an empty string. The signal that matters to siblings
+	// is "the turn ended," not its terminal reason — gating on stopReason
+	// being non-empty drops the notification entirely for agents that
+	// don't populate it (e.g. some Claude Code variants), leaving siblings
+	// stuck thinking a turn is still in flight.
 	var resp struct {
 		Result struct {
 			StopReason string `json:"stopReason"`
-			SessionID  string `json:"sessionId"`
 		} `json:"result"`
 	}
-	if err := json.Unmarshal(responseLine, &resp); err != nil {
-		return
-	}
-
+	_ = json.Unmarshal(responseLine, &resp)
 	stopReason := resp.Result.StopReason
-	if stopReason == "" {
-		return
-	}
-
-	// Try to get sessionId from the response; fall back to empty
-	sessionID := resp.Result.SessionID
 
 	notif := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"method":  "session/update",
 		"params": map[string]interface{}{
-			"sessionId": sessionID,
+			"sessionId": reqParams.SessionID,
 			"update": map[string]interface{}{
 				"sessionUpdate": "turn_complete",
 				"stopReason":    stopReason,
@@ -497,7 +525,66 @@ func (p *Proxy) synthesizeTurnComplete(responseLine []byte, sender *Frontend) {
 	}
 
 	p.cache.AddUpdate(line)
-	go p.broadcastExcept(line, sender)
+	go p.broadcastExcept(line, pr.frontend)
+}
+
+// synthesizePermissionResolved broadcasts a transient notification to every
+// frontend except the responder when a session/request_permission has been
+// resolved. Lets sibling frontends drop their stale "permission requested"
+// UI without the user having to click anything. Not added to the cache —
+// the resolution is meaningful only in real time, and a late-joining frontend
+// shouldn't be told about a permission whose request was already cleared from
+// the cache.
+func (p *Proxy) synthesizePermissionResolved(requestID string, responder *Frontend) {
+	notif := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "acp-multiplex/permission_resolved",
+		"params": map[string]interface{}{
+			"requestId": requestID,
+		},
+	}
+	line, err := json.Marshal(notif)
+	if err != nil {
+		log.Printf("synthesize permission resolved: marshal: %v", err)
+		return
+	}
+	go p.broadcastExcept(line, responder)
+}
+
+// synthesizeModelChange broadcasts a current_model_update notification to all
+// frontends when a session/set_model request succeeds. The agent doesn't emit
+// this notification itself, so the proxy must synthesize it from the original
+// request params. Mirrors synthesizeModeChange.
+func (p *Proxy) synthesizeModelChange(pr *PendingRequest) {
+	var params struct {
+		SessionID string `json:"sessionId"`
+		ModelID   string `json:"modelId"`
+	}
+	if err := json.Unmarshal(pr.params, &params); err != nil {
+		log.Printf("synthesize model change: parse params: %v", err)
+		return
+	}
+
+	notif := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "session/update",
+		"params": map[string]interface{}{
+			"sessionId": params.SessionID,
+			"update": map[string]interface{}{
+				"sessionUpdate":  "current_model_update",
+				"currentModelId": params.ModelID,
+			},
+		},
+	}
+
+	line, err := json.Marshal(notif)
+	if err != nil {
+		log.Printf("synthesize model change: marshal: %v", err)
+		return
+	}
+
+	p.cache.AddUpdate(line)
+	go p.broadcastExcept(line, pr.frontend)
 }
 
 // synthesizeModeChange broadcasts a current_mode_update notification to all
