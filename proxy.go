@@ -268,6 +268,13 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 		if err == nil {
 			p.cache.SetNewResponse(rewritten)
 		}
+	case "session/load":
+		// Unlike session/new, load responses need not contain sessionId.
+		// Keep the primary's response intact, but enrich the cached copy so
+		// a late-joining client can identify and prompt the restored session.
+		if len(env.Error) == 0 {
+			p.cacheLoadedSession(pr.params, env.Result)
+		}
 	}
 
 	// For session/prompt responses, synthesize a turn-complete notification
@@ -292,6 +299,33 @@ func (p *Proxy) routeResponseToFrontend(env *Envelope, line []byte) {
 		log.Printf("send to frontend %d: %.100s", pr.frontend.id, string(rewritten))
 	}
 	pr.frontend.Send(rewritten)
+}
+
+func (p *Proxy) cacheLoadedSession(params, result json.RawMessage) {
+	var request struct {
+		SessionID string `json:"sessionId"`
+		Cwd       string `json:"cwd"`
+	}
+	if json.Unmarshal(params, &request) != nil || request.SessionID == "" {
+		return
+	}
+	var fields map[string]json.RawMessage
+	if len(result) > 0 && json.Unmarshal(result, &fields) != nil {
+		return
+	}
+	if fields == nil {
+		fields = make(map[string]json.RawMessage)
+	}
+	fields["sessionId"], _ = json.Marshal(request.SessionID)
+	if request.Cwd != "" {
+		fields["cwd"], _ = json.Marshal(request.Cwd)
+	}
+	line, err := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": 0, "result": fields,
+	})
+	if err == nil {
+		p.cache.SetNewResponse(line)
+	}
 }
 
 // routeReverseCall routes an agent-initiated request to the appropriate frontend(s).
